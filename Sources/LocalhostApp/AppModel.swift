@@ -24,11 +24,50 @@ final class AppModel: ObservableObject {
         processManager.onTerminated = { [weak self] name in
             guard let self else { return }
             self.pendingBrowserOpen.remove(name)
+            let crashLog = self.processManager.crashLog(for: name)
+
+            // A process that dies moments after Play is usually a transient — a post-reboot
+            // load storm, a port not yet released by a dying predecessor — not a broken
+            // project. Sweep the ports and retry once; a second death is real and shows as
+            // crashed with the log. The budget resets when the app reaches .running or the
+            // user presses Stop/Play themselves.
+            if let app = self.apps.first(where: { $0.name == name }),
+               let started = app.startedAt, Date().timeIntervalSince(started) < 60,
+               !self.autoRetried.contains(name) {
+                self.autoRetried.insert(name)
+                self.update(name) {
+                    $0.isRunning = false
+                    $0.portStatus = .starting
+                    $0.backendRunning = false
+                    $0.crashLog = crashLog
+                }
+                self.refreshLauncher()
+                let ports = [app.detectedPort ?? app.port] + app.sidecarTargets.compactMap(\.port)
+                Task { [weak self] in
+                    // The crashed leader's children may outlive it and still hold the ports;
+                    // retrying into EADDRINUSE would just burn the one retry for nothing.
+                    await Task.detached(priority: .userInitiated) {
+                        for port in ports { SystemClient.killPort(port) }
+                        for _ in 0..<10 {
+                            if !ports.contains(where: { SystemClient.isPortListening($0) }) { break }
+                            try? await Task.sleep(nanoseconds: 500_000_000)
+                        }
+                    }.value
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    guard let self, self.autoRetried.contains(name),
+                          let fresh = self.apps.first(where: { $0.name == name }),
+                          !fresh.isRunning
+                    else { return }
+                    self.start(app: fresh, isRetry: true)
+                }
+                return
+            }
+
             self.update(name) { app in
                 app.isRunning = false
                 app.portStatus = .crashed
                 app.backendRunning = false
-                app.crashLog = self.processManager.crashLog(for: name)
+                app.crashLog = crashLog
             }
             self.refreshLauncher()
         }
@@ -88,6 +127,11 @@ final class AppModel: ObservableObject {
     /// show a dead page for the ~20s a Convex + Next stack needs; we open when the port answers.
     private var pendingBrowserOpen: Set<String> = []
 
+    /// Apps that already used their one automatic restart after an early crash. Membership
+    /// means "the next death is final" — cleared when the app reaches .running or the user
+    /// intervenes, so every fresh attempt gets one retry of its own.
+    private var autoRetried: Set<String> = []
+
     var openBrowserOnReady: Bool {
         get { defaults.object(forKey: "openBrowserOnReady") == nil ? true : defaults.bool(forKey: "openBrowserOnReady") }
         set { defaults.set(newValue, forKey: "openBrowserOnReady") }
@@ -95,6 +139,7 @@ final class AppModel: ObservableObject {
 
     /// Flip a row to .running and, if this run still owes a browser tab, open it now.
     private func markRunning(_ name: String, port: Int) {
+        autoRetried.remove(name)
         update(name) { $0.portStatus = .running }
         if pendingBrowserOpen.remove(name) != nil, openBrowserOnReady {
             SystemClient.openBrowser(port: port)
@@ -253,6 +298,10 @@ final class AppModel: ObservableObject {
                 // The process died and nothing else took the port — the crash (and its log)
                 // stays on the row until the user restarts or stops it.
                 status = .crashed; detectedPort = nil; externalPID = nil
+            } else if previous[name]?.portStatus == .starting, autoRetried.contains(name) {
+                // Between an early crash and its automatic retry there's a brief window with
+                // no process — the row stays "starting", not "free", through it.
+                status = .starting; detectedPort = nil; externalPID = nil
             } else {
                 status = .free; detectedPort = nil; externalPID = nil
             }
@@ -348,8 +397,9 @@ final class AppModel: ObservableObject {
         processManager.clearLog(for: app.name)
     }
 
-    func start(app: DevApp) {
+    func start(app: DevApp, isRetry: Bool = false) {
         guard let root = portfolioRoot else { return }
+        if !isRetry { autoRetried.remove(app.name) }
         processManager.start(
             name: app.name,
             port: app.port,
@@ -448,6 +498,7 @@ final class AppModel: ObservableObject {
 
     func stop(app: DevApp) {
         pendingBrowserOpen.remove(app.name)
+        autoRetried.remove(app.name)
         if app.isRunning {
             processManager.stop(name: app.name)
         } else if let pid = app.externalPID {
@@ -470,6 +521,7 @@ final class AppModel: ObservableObject {
 
     func stopAll() {
         pendingBrowserOpen.removeAll()
+        autoRetried.removeAll()
         processManager.stopAll()
 
         // Stays scoped to listed apps — orphans are deliberately untouched.

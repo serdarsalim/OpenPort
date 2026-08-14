@@ -150,6 +150,15 @@ started/stopped in a terminal. `refresh()` preserves `.crashed` + `crashLog` + `
 from the previous apps array — rebuilding the array must not amnesia away state that only
 lives in it. `refreshInFlight` guards manual vs. quiet overlap.
 
+### Auto-retry on early crash
+A process that dies < 60s after Play gets its ports swept (children of the dead leader may
+still hold them) and one silent restart (`autoRetried` set in AppModel). Second death →
+`.crashed` with log. Budget resets on `.running` or manual Stop/Play (`start(isRetry:)`
+distinguishes the retry path). Born from a real incident: a post-reboot load storm (load
+avg 215 — Spotlight reindex + a parallel agent running fleet deploys) killed freshly
+started dev servers; the projects were fine, the machine wasn't. OpenPort was correctly
+reporting crashed — now it also recovers.
+
 ### Auto-open on ready
 Play inserts the app into `pendingBrowserOpen`; the first poll/refresh that sees the port
 answer opens the browser once (`openBrowserOnReady`, Settings → General, default on).

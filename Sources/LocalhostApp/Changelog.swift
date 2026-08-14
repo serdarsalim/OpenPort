@@ -22,7 +22,8 @@ enum Changelog {
                 "Status column replaces Git — starting / running / terminal / crashed / port busy, live. The Git column is gone (and with it a git call per project per refresh).",
                 "Restart button — one click stops the app, waits until its ports are actually free, and starts it again. Works on crashed rows and terminal-started servers too. Clean Restart (right-click) still does the same plus a cache wipe.",
                 "Menu bar tells the truth at a glance — the icon shows a count of running servers, and each app in the quick-launch menu carries a live status dot (green running, orange starting, red crashed). The menu no longer rebuilds itself shut while you're reading it.",
-                "Archive the projects you never open — hover a stopped row's status cell (or right-click any row) and hit archive. Archived projects fold into a collapsed section at the bottom of the list and disappear from the menu bar, go/ links, and the LAN launcher. Unarchive with one click from the same section. Archiving a running project stops it first."
+                "Archive the projects you never open — hover a stopped row's status cell (or right-click any row) and hit archive. Archived projects fold into a collapsed section at the bottom of the list and disappear from the menu bar, go/ links, and the LAN launcher. Unarchive with one click from the same section. Archiving a running project stops it first.",
+                "One automatic retry on early crash — a dev server that dies within a minute of Play (post-reboot load storms, a port briefly held by a dying predecessor) gets its ports swept and one silent restart. A second death is real and shows as crashed with the log. The retry budget resets whenever the app reaches running or you press Stop/Play yourself."
             ]
         ),
         ChangelogEntry(
