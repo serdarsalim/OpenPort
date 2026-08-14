@@ -398,8 +398,55 @@ final class AppModel: ObservableObject {
     }
 
     func start(app: DevApp, isRetry: Bool = false) {
-        guard let root = portfolioRoot else { return }
+        guard portfolioRoot != nil else { return }
         if !isRetry { autoRetried.remove(app.name) }
+        guard !processManager.isRunning(name: app.name) else { return }
+
+        update(app.name) {
+            // .starting, not .running — Convex + Next stacks take ~20s to bind their port,
+            // and claiming "running" for a port nobody serves is how the globe button opens
+            // a dead tab. The status poll flips it to .running the moment a port answers.
+            $0.isRunning = true
+            $0.portStatus = .starting
+            $0.startedAt = Date()
+            $0.backendRunning = app.needsSidecar || !app.sidecarTargets.isEmpty
+        }
+        pendingBrowserOpen.insert(app.name)
+        refreshProxyRoutes()
+        refreshLauncher()
+
+        // Run right after Stop races the dying listener: Stop's SIGKILL fallback fires
+        // 2s after SIGTERM, and Next answers a busy port by drifting to the next free
+        // one — which we then poll forever while the row says "starting". So the actual
+        // spawn waits until the app's ports are genuinely free, sweeping any half-dead
+        // holder first — the same discipline restart() has always had. The common case
+        // (ports already free) costs one connect() round before spawning.
+        let ports = [app.port] + app.sidecarTargets.compactMap(\.port)
+        Task {
+            let busy = await Task.detached(priority: .userInitiated) {
+                ports.contains { SystemClient.isPortListening($0) }
+            }.value
+            if busy {
+                await Task.detached(priority: .userInitiated) {
+                    for port in ports { SystemClient.killPort(port) }
+                    for _ in 0..<10 {
+                        if !ports.contains(where: { SystemClient.isPortListening($0) }) { break }
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                    }
+                }.value
+            }
+            // The user may have pressed Stop while we waited — spawning anyway would
+            // leave a running tree behind a row that says stopped.
+            guard let fresh = apps.first(where: { $0.name == app.name }),
+                  fresh.isRunning, !processManager.isRunning(name: fresh.name) else { return }
+            launchNow(app: fresh)
+        }
+    }
+
+    /// The actual spawn, after start()'s port gate. Reads the app row fresh so a
+    /// config change during the wait isn't lost.
+    private func launchNow(app: DevApp) {
+        guard let root = portfolioRoot else { return }
         processManager.start(
             name: app.name,
             port: app.port,
@@ -414,18 +461,6 @@ final class AppModel: ObservableObject {
             bindHost: launcherEnabled,
             declaredFramework: app.declaredFramework
         )
-        update(app.name) {
-            // .starting, not .running — Convex + Next stacks take ~20s to bind their port,
-            // and claiming "running" for a port nobody serves is how the globe button opens
-            // a dead tab. The status poll flips it to .running the moment a port answers.
-            $0.isRunning = true
-            $0.portStatus = .starting
-            $0.startedAt = Date()
-            $0.backendRunning = app.needsSidecar || !app.sidecarTargets.isEmpty
-        }
-        pendingBrowserOpen.insert(app.name)
-        refreshProxyRoutes()
-        refreshLauncher()
     }
 
     /// Plain restart: stop, wait for the ports to actually free, start again. Replaces the

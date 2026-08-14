@@ -172,9 +172,18 @@ enum SystemClient {
         kill(pid, SIGTERM)
         for child in descendants { kill(child, SIGTERM) }
         DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+            // Re-walk before escalating: anything the tree spawned AFTER the snapshot
+            // above (a convex push forking tsc, a Turbopack worker) escaped the SIGTERM
+            // pass, and SIGKILLing only the stale list left it running headless —
+            // orphaned typecheck processes from repeated Stop→Run cycles are how an
+            // 8 GB machine ends up at load 600. Union, don't replace: a survivor whose
+            // parent already died is invisible to a fresh walk but still in the snapshot.
+            var doomed = Set(descendants)
+            doomed.formUnion(descendantPIDs(of: pid))
+            for child in descendants { doomed.formUnion(descendantPIDs(of: child)) }
             kill(-pid, SIGKILL)
             kill(pid, SIGKILL)
-            for child in descendants { kill(child, SIGKILL) }
+            for child in doomed { kill(child, SIGKILL) }
         }
     }
 
