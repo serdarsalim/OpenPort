@@ -56,6 +56,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .sink { [weak self] _ in self?.rebuildMenu() }
             .store(in: &cancellables)
 
+        model.$archivedNames
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.rebuildMenu() }
+            .store(in: &cancellables)
+
         NotificationCenter.default
             .publisher(for: UserDefaults.didChangeNotification)
             .receive(on: RunLoop.main)
@@ -108,15 +113,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Badge the icon with how many servers are up — the glance that answers
         // "is anything running?" without even opening the menu.
-        let activeCount = model.apps.filter { $0.portStatus == .running || $0.portStatus == .detached }.count
+        let activeCount = model.activeApps.filter { $0.portStatus == .running || $0.portStatus == .detached }.count
         statusItem?.button?.title = activeCount > 0 ? " \(activeCount)" : ""
         statusItem?.button?.imagePosition = activeCount > 0 ? .imageLeading : .imageOnly
 
         let menu = NSMenu()
         menu.delegate = self
 
-        if !model.apps.isEmpty {
-            for app in model.apps {
+        let menuApps = model.activeApps
+        if !menuApps.isEmpty {
+            for app in menuApps {
                 let isActive = app.isRunning || app.portStatus == .detached
                 let canOpen = app.portStatus == .running || app.portStatus == .detached
                 let port = app.detectedPort ?? app.port

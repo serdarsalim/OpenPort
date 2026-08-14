@@ -241,8 +241,8 @@ struct DashboardView: View {
     }
 
     private var filteredApps: [DevApp] {
-        guard !searchText.isEmpty else { return model.apps }
-        return model.apps.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        guard !searchText.isEmpty else { return model.activeApps }
+        return model.activeApps.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
 
     private var appearanceBinding: Binding<ThemeMode> {
@@ -379,6 +379,16 @@ struct DashboardView: View {
                     .listRowSeparator(.visible)
             }
 
+            if !model.archivedApps.isEmpty {
+                archivedHeader
+                if archivedExpanded {
+                    ForEach(model.archivedApps) { app in
+                        ArchivedRowView(app: app, model: model)
+                            .listRowSeparator(.visible)
+                    }
+                }
+            }
+
             if !model.orphans.isEmpty {
                 otherPortsHeader
                 ForEach(model.orphans) { orphan in
@@ -388,6 +398,34 @@ struct DashboardView: View {
             }
         }
         .listStyle(.inset)
+    }
+
+    @AppStorage("archivedSectionExpanded") private var archivedExpanded = false
+
+    private var archivedHeader: some View {
+        Button { archivedExpanded.toggle() } label: {
+            HStack(spacing: 6) {
+                Image(systemName: archivedExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                Image(systemName: "archivebox")
+                    .font(.caption)
+                Text("Archived")
+                Text("(\(model.archivedApps.count))")
+                    .foregroundStyle(.tertiary)
+                Spacer()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 10)
+        .padding(.top, 14)
+        .padding(.bottom, 4)
+        .font(.caption)
+        .fontWeight(.medium)
+        .foregroundStyle(.secondary)
+        .listRowInsets(EdgeInsets())
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
     }
 
     private var otherPortsHeader: some View {
@@ -409,6 +447,45 @@ struct DashboardView: View {
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
         .allowsHitTesting(false)
+    }
+}
+
+/// A folded-away project: name and port only, with one click to bring it back. Deliberately
+/// inert — no play button, no actions — so the archive reads as storage, not as a second list.
+private struct ArchivedRowView: View {
+    let app: DevApp
+    @ObservedObject var model: AppModel
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Color.clear.frame(width: 28)
+            Text(app.name)
+                .foregroundStyle(.secondary)
+            Text(verbatim: "\(app.port)")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            Spacer()
+            if isHovered {
+                Button { model.unarchive(app.name) } label: {
+                    Label("Unarchive", systemImage: "tray.and.arrow.up")
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Move back to the main list")
+            }
+        }
+        .padding(.vertical, 5)
+        .padding(.horizontal, 10)
+        .background(isHovered ? Color.primary.opacity(0.06) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .onHover { isHovered = $0 }
+        .contextMenu {
+            Button { model.unarchive(app.name) } label: {
+                Label("Unarchive", systemImage: "tray.and.arrow.up")
+            }
+        }
     }
 }
 

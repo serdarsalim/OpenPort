@@ -62,6 +62,12 @@ struct AppRowView: View {
                 }
                 .help("Stop, delete the build cache, then start fresh. Use when the server is wedged and a plain restart doesn't fix it.")
             }
+            Button {
+                model.archive(app: app)
+            } label: {
+                Label("Archive", systemImage: "archivebox")
+            }
+            .help("Hide this project in the Archived section at the bottom of the list. Stops it first if running.")
         }
     }
 
@@ -340,7 +346,19 @@ struct AppRowView: View {
                     .foregroundStyle(.orange)
                     .help("Another project is using port \(app.port)")
             case .free:
-                Text("—").foregroundStyle(.tertiary).font(.caption)
+                // A stopped row's status cell is dead space — on hover it becomes the
+                // archive control, so decluttering never means a trip to Settings.
+                if isHovered {
+                    Button { model.archive(app: app) } label: {
+                        Label("archive", systemImage: "archivebox")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Hide this project in the Archived section at the bottom of the list")
+                } else {
+                    Text("—").foregroundStyle(.tertiary).font(.caption)
+                }
             }
         }
         .frame(width: 110, alignment: .leading)

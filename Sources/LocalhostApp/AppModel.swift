@@ -20,6 +20,7 @@ final class AppModel: ObservableObject {
         if let path = defaults.string(forKey: "portfolioRoot") {
             portfolioRoot = URL(fileURLWithPath: path)
         }
+        archivedNames = Set(defaults.stringArray(forKey: "archivedApps") ?? [])
         processManager.onTerminated = { [weak self] name in
             guard let self else { return }
             self.pendingBrowserOpen.remove(name)
@@ -49,6 +50,33 @@ final class AppModel: ObservableObject {
 
     deinit {
         pollTask?.cancel()
+    }
+
+    // MARK: - Archive
+
+    /// Projects hidden from the dashboard, menu bar, go/ links, and LAN launcher. The scan
+    /// still sees them (so unarchiving is instant and ports stay reserved) — they're folded
+    /// into a collapsed section instead of cluttering the list.
+    @Published private(set) var archivedNames: Set<String> = []
+
+    var activeApps: [DevApp] { apps.filter { !archivedNames.contains($0.name) } }
+    var archivedApps: [DevApp] { apps.filter { archivedNames.contains($0.name) } }
+
+    func archive(app: DevApp) {
+        // Archiving means "I don't use this" — a running server contradicts that, and a
+        // hidden row must never own a live process.
+        if app.isRunning || app.portStatus == .detached { stop(app: app) }
+        archivedNames.insert(app.name)
+        defaults.set(Array(archivedNames).sorted(), forKey: "archivedApps")
+        refreshProxyRoutes()
+        refreshLauncher()
+    }
+
+    func unarchive(_ name: String) {
+        archivedNames.remove(name)
+        defaults.set(Array(archivedNames).sorted(), forKey: "archivedApps")
+        refreshProxyRoutes()
+        refreshLauncher()
     }
 
     // MARK: - Status polling
@@ -534,7 +562,7 @@ final class AppModel: ObservableObject {
     }
 
     private func refreshLauncher() {
-        let infos = apps.map { app in
+        let infos = activeApps.map { app in
             LaunchAppInfo(
                 name: app.name,
                 port: app.detectedPort ?? app.port,
@@ -563,7 +591,7 @@ final class AppModel: ObservableObject {
     private func refreshProxyRoutes() {
         guard defaults.bool(forKey: "goLinksEnabled") else { return }
         var routes: [String: Int] = [:]
-        for app in apps {
+        for app in activeApps {
             routes[app.goAlias] = app.detectedPort ?? app.port
         }
         proxyServer.updateRoutes(routes)
