@@ -165,7 +165,8 @@ struct AppScanner: Sendable {
             if seenNames.contains(name) { name += "-\(seenNames.count + 1)" }
             seenNames.insert(name)
             return DeclaredTarget(
-                target: RunTarget(name: name, command: command, port: entry["port"] as? Int),
+                target: RunTarget(name: name, command: command,
+                                  port: (entry["port"] as? Int).flatMap { PortStore.isValid($0) ? $0 : nil }),
                 backend: (entry["backend"] as? [String: Any]).map(Self.parseBackend),
                 caches: entry["caches"] as? [String]
             )
@@ -282,7 +283,7 @@ struct AppScanner: Sendable {
         guard let regex = try? NSRegularExpression(pattern: pattern),
               let match = regex.firstMatch(in: script, range: NSRange(script.startIndex..., in: script)),
               let range = Range(match.range(at: 1), in: script),
-              let port = Int(script[range])
+              let port = Int(script[range]), PortStore.isValid(port)
         else { return nil }
         return port
     }

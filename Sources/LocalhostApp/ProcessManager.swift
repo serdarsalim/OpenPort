@@ -43,7 +43,7 @@ final class ProcessManager {
             // graft on host flags: the project already stated what it wants, and rewriting a
             // command we can't parse (a launcher script, a wrapper) is how we'd break it.
             base = primaryCommand; viaNpm = false; declared = true
-        } else if let script = devScript, script.contains("-p") || script.contains("--port") {
+        } else if let script = devScript, Self.hasPortFlag(script) {
             base = patchPort(in: script, to: port); viaNpm = false; declared = false
         } else if let script = devScript, framework == .vite {
             // Vite is the one framework that ignores PORT/VITE_PORT outright — the port must
@@ -351,6 +351,16 @@ final class ProcessManager {
         }
 
         return process
+    }
+
+    /// A real `-p 3000` / `--port 3000` / `--port=3000`. A bare substring test also matched
+    /// `--parallel`, `--prefix`, `run-p`, `-preview` and ran those scripts directly, skipping
+    /// npm's pre/post hooks and Vite's port flag.
+    private static let portFlag = try? NSRegularExpression(pattern: #"(?:^|\s)(?:-p|--port)(?:\s+|=)\d{2,5}\b"#)
+
+    static func hasPortFlag(_ script: String) -> Bool {
+        guard let portFlag else { return false }
+        return portFlag.firstMatch(in: script, range: NSRange(script.startIndex..., in: script)) != nil
     }
 
     private func patchPort(in script: String, to port: Int) -> String {

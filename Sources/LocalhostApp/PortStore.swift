@@ -6,7 +6,13 @@ struct PortStore {
 
     func load() -> [String: Int] {
         guard let raw = defaults.dictionary(forKey: key) else { return [:] }
-        return raw.compactMapValues { $0 as? Int }
+        // Out-of-range values (a typo'd 300001 saved before validation existed) are dropped
+        // and reassigned rather than trusted.
+        return raw.compactMapValues { $0 as? Int }.filter { Self.isValid($0.value) }
+    }
+
+    static func isValid(_ port: Int) -> Bool {
+        (1...65535).contains(port)
     }
 
     func save(_ ports: [String: Int]) {
@@ -25,7 +31,8 @@ struct PortStore {
         scriptPorts: [String: Int] = [:],
         declaredPorts: [String: Int] = [:]
     ) -> [String: Int] {
-        var ports = load()
+        let stored = load()
+        var ports = stored
 
         for (name, port) in declaredPorts where ports[name] != port {
             ports[name] = port
@@ -49,7 +56,9 @@ struct PortStore {
                 next += 1
             }
         }
-        save(ports)
+        // Writing UserDefaults on every 12s refresh fired didChangeNotification, which rebuilt
+        // the menu bar menu a second time per refresh for nothing.
+        if ports != stored { save(ports) }
         return ports
     }
 }

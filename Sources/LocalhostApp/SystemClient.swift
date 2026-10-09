@@ -52,6 +52,8 @@ enum SystemClient {
     }
 
     static func isPortListening(_ port: Int, host: String = "127.0.0.1") -> Bool {
+        // in_port_t(port) traps outside 0...65535 — one bad saved value crashed every launch.
+        guard (1...65535).contains(port) else { return false }
         let target = host == "localhost" ? "127.0.0.1" : host
         let sock = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard sock >= 0 else { return false }

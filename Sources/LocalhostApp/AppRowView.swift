@@ -306,7 +306,7 @@ struct AppRowView: View {
     }
 
     private func savePort() {
-        guard let port = Int(portDraft) else { editingPort = false; return }
+        guard let port = Int(portDraft), PortStore.isValid(port) else { portConflict = true; return }
         if takenPorts.contains(port) {
             portConflict = true
             return
@@ -318,7 +318,7 @@ struct AppRowView: View {
     private func nudgePort(by delta: Int) {
         var next = (Int(portDraft) ?? app.port) + delta
         while takenPorts.contains(next) { next += delta }
-        portDraft = "\(next)"
+        portDraft = "\(min(max(next, 1), 65535))"
     }
 
     /// Live truth about the server, not about what we asked for. "starting" carries a

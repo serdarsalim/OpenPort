@@ -136,6 +136,10 @@ final class AppModel: ObservableObject {
     /// intervenes, so every fresh attempt gets one retry of its own.
     private var autoRetried: Set<String> = []
 
+    /// Starts accepted but not yet spawned: waiting on the port gate in start(), or on the
+    /// teardown in a restart. Membership is the "go" token — Stop withdraws it.
+    private var pendingStarts: Set<String> = []
+
     var openBrowserOnReady: Bool {
         get { defaults.object(forKey: "openBrowserOnReady") == nil ? true : defaults.bool(forKey: "openBrowserOnReady") }
         set { defaults.set(newValue, forKey: "openBrowserOnReady") }
@@ -224,7 +228,6 @@ final class AppModel: ObservableObject {
         let declaredPorts = scannedByName.compactMapValues(\.declaredPort)
         let ports = portStore.assign(to: appNames, scriptPorts: scriptPorts, declaredPorts: declaredPorts)
         let goAliases = goLinkStore.load()
-        let runningNames = Set(appNames.filter { processManager.isRunning(name: $0) })
 
         async let portTask = withTaskGroup(of: (String, Bool).self) { group in
             for name in appNames {
@@ -240,15 +243,32 @@ final class AppModel: ObservableObject {
 
         let (portListening, detected) = await (portTask, detectTask)
 
+        // Read process state AFTER the lsof wait, not before: a Play, Stop or crash that lands
+        // during those 0.1–4s used to be overwritten by a snapshot taken before it happened
+        // (a crashed row back to "running", a fresh Play flipped to stopped for 12s). A start
+        // still waiting on its port gate counts as ours — it's about to be.
+        let runningNames = Set(appNames.filter { processManager.isRunning(name: $0) || pendingStarts.contains($0) })
+
         // Rebuilding the array must not amnesia away state that only lives in it: a crash
         // (status + log) and the start timestamp would otherwise vanish on the next quiet
         // poll refresh, 12 seconds after the user needed to see them.
         let previous = Dictionary(apps.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
 
-        // Group all detected listeners by their cwd. One cwd may have many ports.
-        var detectedByDir: [String: [DetectedServer]] = [:]
+        // Group detected listeners by the project folder they run in — the folder itself or
+        // anywhere below it (a monorepo's apps/web, a `cd web && vite`). One folder may have
+        // many ports. Listeners outside every project fall through to the orphan list.
+        let knownFolders = Set(scanned.map(\.folder))
+        let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        var detectedByFolder: [String: [DetectedServer]] = [:]
+        var outsideProjects: [DetectedServer] = []
         for entry in detected {
-            detectedByDir[entry.directory, default: []].append(entry)
+            if entry.directory.hasPrefix(rootPrefix),
+               let folder = entry.directory.dropFirst(rootPrefix.count).split(separator: "/").first.map(String.init),
+               knownFolders.contains(folder) {
+                detectedByFolder[folder, default: []].append(entry)
+            } else {
+                outsideProjects.append(entry)
+            }
         }
 
         // Hand each folder's listeners to its rows. A folder with one row keeps the old rule:
@@ -262,7 +282,7 @@ final class AppModel: ObservableObject {
         var listenersByRow: [String: [DetectedServer]] = [:]
         var unclaimed: [DetectedServer] = []
         for (folder, rows) in rowsByFolder {
-            let listeners = detectedByDir[root.appendingPathComponent(folder).path] ?? []
+            let listeners = detectedByFolder[folder] ?? []
             guard rows.count > 1 else {
                 if let only = rows.first { listenersByRow[only] = listeners }
                 continue
@@ -281,7 +301,6 @@ final class AppModel: ObservableObject {
             else { unclaimed.append(contentsOf: leftovers) }
         }
 
-        let appDirSet = Set(scanned.map { root.appendingPathComponent($0.folder).path })
         let firstRowOfFolder = Set(rowsByFolder.values.compactMap(\.first))
 
         apps = appNames.map { name in
@@ -320,7 +339,11 @@ final class AppModel: ObservableObject {
             let detectedPort: Int?
             let externalPID: Int32?
 
-            if weStartedIt && assignedPortListening {
+            if pendingStarts.contains(name) {
+                // Still waiting for the old listener to let go of the port (Restart, or Play
+                // right after Stop). Whatever answers on it now is the dying predecessor.
+                status = .starting; detectedPort = nil; externalPID = nil
+            } else if weStartedIt && assignedPortListening {
                 status = .running; detectedPort = nil; externalPID = nil
             } else if weStartedIt {
                 // Our process is alive but the assigned port isn't bound. Either it's still
@@ -384,7 +407,7 @@ final class AppModel: ObservableObject {
         // multi-target folder's listeners that no running instance owns. System daemons,
         // installed Mac apps, and OpenPort itself are filtered out: killing those breaks
         // Continuity, Tailscale, ssh tunnels, etc.
-        orphans = (detected.filter { !appDirSet.contains($0.directory) } + unclaimed)
+        orphans = (outsideProjects + unclaimed)
             .filter { !Self.isSystemOrInstalledApp($0) }
             .map { OrphanPort(pid: $0.pid, port: $0.port, directory: $0.directory, command: $0.command) }
             .sorted { $0.port < $1.port }
@@ -454,6 +477,7 @@ final class AppModel: ObservableObject {
             $0.backendRunning = app.needsSidecar
         }
         if openBrowser { pendingBrowserOpen.insert(app.name) }
+        pendingStarts.insert(app.name)
         refreshProxyRoutes()
         refreshLauncher()
 
@@ -477,10 +501,11 @@ final class AppModel: ObservableObject {
                     }
                 }.value
             }
-            // The user may have pressed Stop while we waited — spawning anyway would
-            // leave a running tree behind a row that says stopped.
-            guard let fresh = apps.first(where: { $0.name == app.name }),
-                  fresh.isRunning, !processManager.isRunning(name: fresh.name) else { return }
+            // The user may have pressed Stop while we waited (which withdraws the pending
+            // start) — spawning anyway would leave a running tree behind a stopped row.
+            guard pendingStarts.remove(app.name) != nil,
+                  let fresh = apps.first(where: { $0.name == app.name }),
+                  !processManager.isRunning(name: fresh.name) else { return }
             launchNow(app: fresh)
         }
     }
@@ -529,8 +554,12 @@ final class AppModel: ObservableObject {
 
         pendingBrowserOpen.remove(app.name)
         if app.isRunning { processManager.stop(name: app.name) }
+        // Pending from the first moment: the row reads "starting" with a Stop button through
+        // the teardown instead of a Play button that races the relaunch, and a Stop (or Stop
+        // All, or Archive) in that window cancels the relaunch instead of being undone by it.
+        pendingStarts.insert(app.name)
         update(app.name) {
-            $0.isRunning = false; $0.portStatus = .free; $0.detectedPort = nil
+            $0.isRunning = true; $0.portStatus = .starting; $0.startedAt = Date(); $0.detectedPort = nil
             $0.externalPID = nil; $0.backendRunning = false; $0.crashLog = nil; $0.extraPorts = []
         }
         refreshProxyRoutes()
@@ -553,6 +582,7 @@ final class AppModel: ObservableObject {
                     try? await Task.sleep(nanoseconds: 500_000_000)
                 }
             }.value
+            guard pendingStarts.contains(app.name) else { return }
             start(app: app)
         }
     }
@@ -591,7 +621,7 @@ final class AppModel: ObservableObject {
 
     /// Look up an app by name and start it. Used by the LAN launcher's Run button.
     func startByName(_ name: String) {
-        guard let app = apps.first(where: { $0.name == name }), app.portStatus != .external else { return }
+        guard let app = activeApps.first(where: { $0.name == name }), app.portStatus != .external else { return }
         start(app: app)
     }
 
@@ -603,6 +633,7 @@ final class AppModel: ObservableObject {
 
     func stop(app: DevApp) {
         pendingBrowserOpen.remove(app.name)
+        pendingStarts.remove(app.name)
         autoRetried.remove(app.name)
         if app.isRunning {
             processManager.stop(name: app.name)
@@ -622,13 +653,17 @@ final class AppModel: ObservableObject {
 
     func stopAll() {
         pendingBrowserOpen.removeAll()
+        pendingStarts.removeAll()
         autoRetried.removeAll()
         processManager.stopAll()
 
-        // Stays scoped to listed apps — orphans are deliberately untouched.
-        let portsToKill = apps.map { $0.detectedPort ?? $0.port }
-        let externalPIDs = apps.compactMap { $0.externalPID }
-        let extraPIDs = apps.flatMap { $0.extraPorts.map(\.pid) }
+        // Scoped to rows that are actually up. Sweeping every row's assigned port used to kill
+        // whatever unrelated process sat on a stopped or .external row's port (Docker, an ssh
+        // tunnel) — orphans are deliberately untouched too.
+        let live = apps.filter { $0.isRunning || $0.portStatus == .detached }
+        let portsToKill = live.map { $0.detectedPort ?? $0.port }
+        let externalPIDs = live.compactMap { $0.externalPID }
+        let extraPIDs = live.flatMap { $0.extraPorts.map(\.pid) }
 
         for idx in apps.indices {
             apps[idx].isRunning = false
