@@ -584,12 +584,8 @@ final class AppModel: ObservableObject {
 
     /// Synchronous shutdown. Blocks ~500ms so children die before OpenPort exits, otherwise
     /// they reparent to launchd and outlive every future OpenPort launch invisibly.
-    func nukeAllSync() {
-        processManager.nukeAllSync()
-        let pids = apps.compactMap { $0.externalPID } + apps.flatMap { $0.extraPorts.map(\.pid) }
-        for pid in pids { kill(pid, SIGTERM) }
-        usleep(300_000)
-        for pid in pids { kill(pid, SIGKILL) }
+    func nukeAllSync(alsoKilling extraTrees: [Int32] = []) {
+        processManager.nukeAllSync(alsoKilling: extraTrees)
     }
 
     /// Reap leftover processes from a previous (crashed/quit-without-cleanup) OpenPort session.

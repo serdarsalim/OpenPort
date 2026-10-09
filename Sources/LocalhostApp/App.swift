@@ -73,9 +73,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Synchronous SIGTERM → 500ms → SIGKILL on every spawned PID. Without this, children
-        // get reparented to launchd (PPID=1) and outlive every future OpenPort launch invisibly.
-        model.nukeAllSync()
+        // Synchronous SIGTERM → 500ms → SIGKILL on every tree we own: servers Play started and
+        // whatever runs inside our terminal tabs (their pty dies with us, so a dev server in
+        // one would otherwise reparent to launchd and outlive every future OpenPort launch).
+        // Servers started in some other terminal are left alone — that terminal still owns them.
+        model.nukeAllSync(alsoKilling: terminalStore.shellPIDs)
     }
 
     private func setupMenuBarIcon() {

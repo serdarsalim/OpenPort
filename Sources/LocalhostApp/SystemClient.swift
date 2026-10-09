@@ -137,7 +137,10 @@ enum SystemClient {
     }
 
     static func killPort(_ port: Int) {
-        let output = runCommand("/usr/sbin/lsof", ["-ti", "TCP:\(port)"])
+        // LISTEN only. A bare `-i TCP:port` also matches every CLIENT connected to the port —
+        // the browser tab you have open on localhost:3012 — so Stop used to SIGTERM the
+        // browser's network process along with the dev server.
+        let output = runCommand("/usr/sbin/lsof", ["-ti", "TCP:\(port)", "-sTCP:LISTEN"])
         for pidStr in output.components(separatedBy: .newlines) {
             let trimmed = pidStr.trimmingCharacters(in: .whitespaces)
             if let pid = Int32(trimmed), pid > 0 {
@@ -190,15 +193,30 @@ enum SystemClient {
     /// Synchronous SIGTERM → 500ms wait → SIGKILL. For app shutdown where we can't rely on
     /// async dispatch firing before exit.
     static func killTreeSync(pid: Int32) {
-        guard pid > 0, pid != getpid() else { return }
-        let descendants = descendantPIDs(of: pid)
-        kill(-pid, SIGTERM)
-        kill(pid, SIGTERM)
-        for child in descendants { kill(child, SIGTERM) }
+        killTreesSync(pids: [pid])
+    }
+
+    /// Several trees at once, one shared 500ms grace period. Quitting with three servers up
+    /// shouldn't cost 1.5s. Descendants are walked BEFORE the SIGTERM: launchers like
+    /// `convex dev --start` and nudge's dev scripts spawn their children detached (own
+    /// session), so a group kill on the leader never reaches them, and once the leader dies
+    /// they reparent to launchd and a later walk can't find them either. That is exactly how
+    /// quitting OpenPort used to leave `next dev` serving :3012 with nobody watching it.
+    static func killTreesSync(pids: [Int32]) {
+        let me = getpid()
+        let leaders = pids.filter { $0 > 0 && $0 != me }
+        guard !leaders.isEmpty else { return }
+        var doomed = Set(leaders)
+        for pid in leaders { doomed.formUnion(descendantPIDs(of: pid)) }
+        doomed.remove(me)
+        for pid in leaders { kill(-pid, SIGTERM) }
+        for pid in doomed { kill(pid, SIGTERM) }
         usleep(500_000)
-        kill(-pid, SIGKILL)
-        kill(pid, SIGKILL)
-        for child in descendants { kill(child, SIGKILL) }
+        // Anything forked during the grace period is a child of a survivor — catch it too.
+        for pid in Array(doomed) { doomed.formUnion(descendantPIDs(of: pid)) }
+        doomed.remove(me)
+        for pid in leaders { kill(-pid, SIGKILL) }
+        for pid in doomed { kill(pid, SIGKILL) }
     }
 
     /// Find orphaned processes (PPID == 1) whose working directory sits under `root`.

@@ -101,6 +101,11 @@ final class TerminalSessionStore: ObservableObject {
         }
     }
 
+    /// Login-shell PIDs of every open tab — the roots of whatever the user is running in them.
+    var shellPIDs: [Int32] {
+        sessions.map { $0.terminalView.process.shellPid }.filter { $0 > 0 }
+    }
+
     func select(_ id: UUID) {
         selectedTab = .session(id)
     }

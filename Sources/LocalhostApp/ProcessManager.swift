@@ -146,19 +146,13 @@ final class ProcessManager {
 
     /// Synchronous nuke for app shutdown. SIGTERM → 500ms wait → SIGKILL, blocking briefly so
     /// children actually die before we exit (otherwise they reparent to launchd as orphans).
-    func nukeAllSync() {
+    func nukeAllSync(alsoKilling extraTrees: [Int32] = []) {
         let pids = (running.values.map(\.processIdentifier)
-            + backends.values.flatMap { $0 }.map(\.processIdentifier))
+            + backends.values.flatMap { $0 }.map(\.processIdentifier)
+            + extraTrees)
             .filter { $0 > 0 }
-        for pid in pids {
-            kill(-pid, SIGTERM)
-            kill(pid, SIGTERM)
-        }
-        usleep(500_000)
-        for pid in pids {
-            kill(-pid, SIGKILL)
-            kill(pid, SIGKILL)
-        }
+        for name in running.keys { stopping.insert(name) }
+        SystemClient.killTreesSync(pids: pids)
     }
 
     func isRunning(name: String) -> Bool {
