@@ -751,6 +751,7 @@ final class AppModel: ObservableObject {
                 name: app.name,
                 port: app.detectedPort ?? app.port,
                 isExternal: app.portStatus == .external,
+                isStarting: app.portStatus == .starting,
                 backendLabel: app.hasBackend ? app.backendKind?.label : nil
             )
         }

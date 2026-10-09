@@ -2,23 +2,30 @@ import AppKit
 import Darwin
 
 enum SystemClient {
+    /// The address phones on the same network reach this Mac at. Wi-Fi (en0) first; on a
+    /// dock or Ethernet with Wi-Fi off, the first other en*/bridge IPv4. VPN tunnels (utun)
+    /// and link-local 169.254.x addresses aren't reachable from a phone, so they're skipped.
     static func lanIPAddress() -> String {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0 else { return "localhost" }
         defer { freeifaddrs(ifaddr) }
+        var candidates: [(name: String, ip: String)] = []
         var ptr = ifaddr
         while let current = ptr {
             let iface = current.pointee
-            if iface.ifa_addr.pointee.sa_family == UInt8(AF_INET),
-               String(cString: iface.ifa_name) == "en0" {
-                var addr = iface.ifa_addr.pointee
-                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                getnameinfo(&addr, socklen_t(iface.ifa_addr.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
-                return String(cString: host)
-            }
-            ptr = current.pointee.ifa_next
+            ptr = iface.ifa_next
+            guard let sa = iface.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET),
+                  iface.ifa_flags & UInt32(IFF_UP) != 0, iface.ifa_flags & UInt32(IFF_LOOPBACK) == 0
+            else { continue }
+            let name = String(cString: iface.ifa_name)
+            guard name.hasPrefix("en") || name.hasPrefix("bridge") else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+            let ip = String(cString: host)
+            if ip.hasPrefix("169.254.") { continue }
+            candidates.append((name, ip))
         }
-        return "localhost"
+        return (candidates.first { $0.name == "en0" } ?? candidates.first)?.ip ?? "localhost"
     }
 
     static func copyNetworkURL(port: Int) {
@@ -240,19 +247,33 @@ enum SystemClient {
             }
         }
         guard !inRoot.isEmpty else { return [] }
-        // Step 2: filter to those reparented to launchd (PPID=1).
+        // Step 2: filter to dev-tool processes reparented to launchd (PPID=1). "Orphan in the
+        // portfolio" alone also matched a tmux server first started in a project folder (it
+        // runs with PPID 1 and keeps that cwd) — killing it took every shell in it down.
         let pidList = inRoot.map(String.init).joined(separator: ",")
-        let psOut = runCommand("/bin/ps", ["-p", pidList, "-o", "pid=,ppid="])
+        let psOut = runCommand("/bin/ps", ["-p", pidList, "-o", "pid=,ppid=,command="])
         var orphans: [Int32] = []
         let me = getpid()
         for raw in psOut.components(separatedBy: "\n") {
-            let parts = raw.split(separator: " ", omittingEmptySubsequences: true)
-            guard parts.count >= 2,
+            let parts = raw.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            guard parts.count == 3,
                   let pid = Int32(parts[0]),
                   let ppid = Int32(parts[1]) else { continue }
-            if ppid == 1, pid != me { orphans.append(pid) }
+            if ppid == 1, pid != me, isDevToolCommand(String(parts[2])) { orphans.append(pid) }
         }
         return orphans
+    }
+
+    /// Processes a dev server tree is made of. Matched on the executable's name, so a shell,
+    /// multiplexer, ssh tunnel or editor under the portfolio is never a candidate.
+    private static let devTools: Set<String> = [
+        "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "tsx", "esbuild", "vite", "turbo",
+        "next-server", "next-router-worker", "next-render-worker", "convex-local-backend",
+    ]
+
+    static func isDevToolCommand(_ command: String) -> Bool {
+        guard let first = command.split(separator: " ").first else { return false }
+        return devTools.contains((String(first) as NSString).lastPathComponent)
     }
 
     /// Run a tool and return its stdout, never blocking longer than `timeout` (+1s grace).

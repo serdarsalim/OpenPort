@@ -139,8 +139,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     onToggle: { [weak self] in
                         guard let self,
                               let target = self.model.apps.first(where: { $0.name == appName }) else { return }
-                        if target.isRunning { self.model.stop(app: target) }
-                        else { self.model.start(app: target) }
+                        // Mirror the dashboard: a terminal-started server shows Stop, so the
+                        // toggle stops it (start() would kill it and relaunch under OpenPort),
+                        // and a port held by something unrelated never gets "started" over.
+                        if target.isRunning || target.portStatus == .detached {
+                            self.model.stop(app: target)
+                        } else if target.portStatus != .external {
+                            self.model.start(app: target)
+                        }
                         self.rebuildMenu()
                     },
                     onOpenBrowser: {

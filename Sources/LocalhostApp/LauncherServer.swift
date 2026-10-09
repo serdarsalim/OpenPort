@@ -54,9 +54,21 @@ final class LauncherServer: @unchecked Sendable {
 
     private func handle(_ connection: NWConnection) {
         connection.start(queue: .global(qos: .utility))
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, _ in
+        receive(on: connection, buffered: Data())
+    }
+
+    /// Read until the whole request is in. A phone's POST often sends the body in a second
+    /// TCP segment; parsing only the first one meant Run silently did nothing.
+    private func receive(on connection: NWConnection, buffered: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self else { connection.cancel(); return }
-            let request = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            var buffer = buffered
+            if let data { buffer.append(data) }
+            if !Self.isCompleteRequest(buffer), !isComplete, error == nil, buffer.count < 65536 {
+                self.receive(on: connection, buffered: buffer)
+                return
+            }
+            let request = String(decoding: buffer, as: UTF8.self)
             let (status, headers, body) = self.route(request)
 
             var head = "HTTP/1.1 \(status)\r\n"
@@ -86,6 +98,12 @@ final class LauncherServer: @unchecked Sendable {
             return ("200 OK", [("Content-Type", "text/plain")], Data("ok".utf8))
 
         case ("POST", "/start"), ("POST", "/stop"):
+            // Any web page you visit can auto-submit a form to 127.0.0.1:1453 — a "simple"
+            // cross-site POST gets no preflight. Browsers mark those with Origin and
+            // Sec-Fetch-Site; our own page's forms are same-origin.
+            guard Self.isSameOrigin(request) else {
+                return ("403 Forbidden", [("Content-Type", "text/plain")], Data("Cross-site request refused".utf8))
+            }
             // PRG: trigger the action, then redirect to a fresh GET so a refresh doesn't re-POST.
             let body = request.components(separatedBy: "\r\n\r\n").dropFirst().joined(separator: "\r\n\r\n")
             if let name = Self.formValue(body, key: "app") {
@@ -96,6 +114,35 @@ final class LauncherServer: @unchecked Sendable {
         default:
             return ("404 Not Found", [("Content-Type", "text/plain")], Data("Not found".utf8))
         }
+    }
+
+    private static func headers(of request: String) -> [String: String] {
+        let head = request.components(separatedBy: "\r\n\r\n").first ?? ""
+        var result: [String: String] = [:]
+        for line in head.components(separatedBy: "\r\n").dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let key = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            result[key] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+        }
+        return result
+    }
+
+    static func isCompleteRequest(_ data: Data) -> Bool {
+        guard let end = data.range(of: Data("\r\n\r\n".utf8)) else { return false }
+        let length = headers(of: String(decoding: data[..<end.upperBound], as: UTF8.self))["content-length"]
+            .flatMap(Int.init) ?? 0
+        return data.count - end.upperBound >= length
+    }
+
+    /// True unless the browser says this came from another site. Requests with no Origin
+    /// (curl, older browsers on a same-origin form) pass; a mismatched Origin or a
+    /// Sec-Fetch-Site of cross-site/same-site does not.
+    static func isSameOrigin(_ request: String) -> Bool {
+        let headers = headers(of: request)
+        if let site = headers["sec-fetch-site"], site != "same-origin", site != "none" { return false }
+        guard let origin = headers["origin"] else { return true }
+        guard let host = headers["host"] else { return false }
+        return origin == "http://\(host)"
     }
 
     private static func formValue(_ body: String, key: String) -> String? {
@@ -122,10 +169,13 @@ final class LauncherServer: @unchecked Sendable {
         let rows = apps.map { app -> String in
             let runningLocal = SystemClient.isPortListening(app.port)
             let lanReachable = haveLAN && runningLocal && SystemClient.isPortListening(app.port, host: ip)
+            let starting = app.isStarting && !runningLocal
 
             let dotClass: String
             let stateText: String
-            if !runningLocal {
+            if starting {
+                dotClass = "local"; stateText = "starting…"
+            } else if !runningLocal {
                 dotClass = "stopped"; stateText = "stopped"
             } else if lanReachable {
                 dotClass = "running"; stateText = "running"
@@ -138,7 +188,9 @@ final class LauncherServer: @unchecked Sendable {
 
             // Action: Open (when LAN-reachable) + Stop when up; Run when down.
             var actions = ""
-            if runningLocal {
+            if starting {
+                actions += Self.form(action: "/stop", app: app.name, label: "Stop", cls: "stop")
+            } else if runningLocal {
                 if lanReachable {
                     actions += "<a class=\"btn open\" href=\"http://\(ip):\(app.port)\" target=\"_blank\" rel=\"noopener\">Open ↗</a>"
                 }
@@ -301,5 +353,6 @@ struct LaunchAppInfo: Sendable {
     let name: String
     let port: Int
     let isExternal: Bool       // another process holds the port — don't offer Run
+    let isStarting: Bool       // Play pressed, port not answering yet — "starting…", not "stopped"
     let backendLabel: String?  // "Convex" / "Supabase", shown as a sub-label
 }
