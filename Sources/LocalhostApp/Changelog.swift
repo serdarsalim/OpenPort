@@ -12,6 +12,21 @@ enum Changelog {
     /// Date format: yyyy-MM-dd.
     static let entries: [ChangelogEntry] = [
         ChangelogEntry(
+            version: "1.7.0",
+            date: "2026-10-09",
+            items: [
+                "Every stack gets its own row. A project whose openport.json lists two run targets now shows two rows (nudge:hubspot, nudge:native), each with its own Play, Stop, status, logs and crash detection. Before, Play could only start both together, and while hubspot was still booting the dashboard grabbed native's port and opened the browser on the wrong app.",
+                "Terminal tabs say what they're running. A tab running npm run dev:hubspot in nudge reads \"nudge:hubspot :3012\" with a green dot. When it's idle it shows the folder you're in.",
+                "Jump from a row to its tab. A server started in an OpenPort tab shows \"tab ↗\" in the status column, and clicking it takes you there. Stop sends that tab a Ctrl-C, so the project's own launcher shuts its stack down cleanly.",
+                "Run in Terminal Tab (right-click a row) runs the row's command in a new tab, so you can watch the output and Ctrl-C it yourself.",
+                "Stop no longer kills your browser. It used to kill anything connected to the port, including the tab you had open on it.",
+                "Quitting OpenPort now cleans up properly. Servers it started and anything running in its tabs go down with it, including grandchildren like next dev that used to survive on :3012 with nothing watching them.",
+                "A start that's taking too long tells you. After 45 seconds the row turns into \"slow · logs\", shows the last log line on hover, and opens the logs on click.",
+                "The LAN launcher refuses cross-site requests (any website could POST to it before), shows \"starting…\" instead of a dead Run button, and handles phones that send the form in two packets.",
+                "Fixed several quieter bugs. Exited processes left log threads spinning. A Restart could get its new process torn down by the old one's exit. An out-of-range port crashed every launch. Auto-retry could loop forever. The launch cleanup could kill a tmux server started in a project folder. Stop All could hit unrelated processes on stopped rows' ports."
+            ]
+        ),
+        ChangelogEntry(
             version: "1.6.0",
             date: "2026-08-14",
             items: [

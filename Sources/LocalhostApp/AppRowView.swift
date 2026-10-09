@@ -328,17 +328,33 @@ struct AppRowView: View {
         Group {
             switch app.portStatus {
             case .starting:
-                HStack(spacing: 5) {
-                    ProgressView().controlSize(.mini)
-                    if let started = app.startedAt {
-                        Text("starting · \(Text(started, style: .relative))")
+                // Re-evaluated every 5s so a boot that's taking too long says so on its own.
+                TimelineView(.periodic(from: .now, by: 5)) { context in
+                    let slow = app.isRunning && (app.startedAt.map { context.date.timeIntervalSince($0) > 45 } ?? false)
+                    if slow {
+                        // 45s is past even a cold Convex + Next boot. Something is usually
+                        // waiting on input, retrying, or failing quietly — the log says which.
+                        Button { showLogs = true } label: {
+                            Label("slow · logs", systemImage: "exclamationmark.triangle.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .help("Still no answer on port \(app.port) after 45s. Last output:\n\(lastLogLine ?? "(nothing yet)")")
                     } else {
-                        Text("starting…")
+                        HStack(spacing: 5) {
+                            ProgressView().controlSize(.mini)
+                            if let started = app.startedAt {
+                                Text("starting · \(Text(started, style: .relative))")
+                            } else {
+                                Text("starting…")
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("Process is up, waiting for the port to answer. The browser opens itself when it does.")
                     }
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .help("Process is up, waiting for the port to answer. The browser opens itself when it does.")
             case .running:
                 Label("running", systemImage: "circle.fill")
                     .font(.caption)
@@ -389,6 +405,13 @@ struct AppRowView: View {
     }
 
     private var activePort: Int { app.detectedPort ?? app.port }
+
+    private var lastLogLine: String? {
+        model.liveLog(for: app)?
+            .split(separator: "\n")
+            .last { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .map(String.init)
+    }
     /// Browser/copy/QR only make sense once something actually answers on the port —
     /// during .starting they'd hand out a dead URL.
     private var isActive: Bool { app.portStatus == .running || app.portStatus == .detached }
