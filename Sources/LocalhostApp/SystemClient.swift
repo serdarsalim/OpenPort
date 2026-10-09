@@ -253,6 +253,14 @@ enum SystemClient {
         return orphans
     }
 
+    /// Run a tool and return its stdout, never blocking longer than `timeout` (+1s grace).
+    ///
+    /// The pipe is drained WHILE the tool runs. Waiting for exit first deadlocked any command
+    /// whose output outgrew the 64 KB pipe buffer — `lsof -d cwd` across every process always
+    /// did, so the orphan sweep hit its timeout every launch and only ever saw a truncated
+    /// list. A tool that outlives the timeout gets SIGKILL, not SIGTERM: an lsof wedged on a
+    /// hung network mount ignores SIGTERM, and that used to stall refresh() — and with it all
+    /// status polling — forever.
     private static func runCommand(_ path: String, _ args: [String], timeout: TimeInterval = 4) -> String {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
@@ -260,12 +268,30 @@ enum SystemClient {
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
-        let sem = DispatchSemaphore(value: 0)
-        p.terminationHandler = { _ in sem.signal() }
-        try? p.run()
-        if sem.wait(timeout: .now() + timeout) == .timedOut { p.terminate() }
-        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        // A spawn failure (process table full — the load-600 case) must return empty, not
+        // fall through to terminate() on a task that never launched, which throws an
+        // Objective-C exception and takes OpenPort down with every child orphaned.
+        do { try p.run() } catch { return "" }
+
+        let output = OutputBox()
+        let done = DispatchSemaphore(value: 0)
+        let reader = pipe.fileHandleForReading
+        DispatchQueue.global(qos: .utility).async {
+            output.data = reader.readDataToEndOfFile()
+            done.signal()
+        }
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            kill(p.processIdentifier, SIGKILL)
+            _ = done.wait(timeout: .now() + 1)
+        }
+        return String(decoding: output.data, as: UTF8.self)
     }
+}
+
+/// Hands bytes from the reader thread back to the caller. The semaphore orders the write
+/// before the read; this only exists to say so to the compiler.
+private final class OutputBox: @unchecked Sendable {
+    var data = Data()
 }
 
 struct DetectedServer: Sendable {

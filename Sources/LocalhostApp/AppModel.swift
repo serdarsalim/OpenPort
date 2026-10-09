@@ -23,14 +23,17 @@ final class AppModel: ObservableObject {
         archivedNames = Set(defaults.stringArray(forKey: "archivedApps") ?? [])
         processManager.onTerminated = { [weak self] name in
             guard let self else { return }
-            self.pendingBrowserOpen.remove(name)
+            // If the browser tab was still owed, the retry owes it; if this run already opened
+            // one, the retry must not open a second.
+            let owedBrowser = self.pendingBrowserOpen.remove(name) != nil
             let crashLog = self.processManager.crashLog(for: name)
 
             // A process that dies moments after Play is usually a transient — a post-reboot
             // load storm, a port not yet released by a dying predecessor — not a broken
             // project. Sweep the ports and retry once; a second death is real and shows as
-            // crashed with the log. The budget resets when the app reaches .running or the
-            // user presses Stop/Play themselves.
+            // crashed with the log. Only the user resets the budget (Stop/Play): resetting it
+            // on .running let an app that boots then dies — an OOM on first compile — loop
+            // forever, opening a browser tab every cycle and never showing "crashed".
             if let app = self.apps.first(where: { $0.name == name }),
                let started = app.startedAt, Date().timeIntervalSince(started) < 60,
                !self.autoRetried.contains(name) {
@@ -58,11 +61,12 @@ final class AppModel: ObservableObject {
                           let fresh = self.apps.first(where: { $0.name == name }),
                           !fresh.isRunning
                     else { return }
-                    self.start(app: fresh, isRetry: true)
+                    self.start(app: fresh, isRetry: true, openBrowser: owedBrowser)
                 }
                 return
             }
 
+            self.autoRetried.remove(name)
             self.update(name) { app in
                 app.isRunning = false
                 app.portStatus = .crashed
@@ -139,7 +143,6 @@ final class AppModel: ObservableObject {
 
     /// Flip a row to .running and, if this run still owes a browser tab, open it now.
     private func markRunning(_ name: String, port: Int) {
-        autoRetried.remove(name)
         update(name) { $0.portStatus = .running }
         if pendingBrowserOpen.remove(name) != nil, openBrowserOnReady {
             SystemClient.openBrowser(port: port)
@@ -436,7 +439,7 @@ final class AppModel: ObservableObject {
         processManager.clearLog(for: app.name)
     }
 
-    func start(app: DevApp, isRetry: Bool = false) {
+    func start(app: DevApp, isRetry: Bool = false, openBrowser: Bool = true) {
         guard portfolioRoot != nil else { return }
         if !isRetry { autoRetried.remove(app.name) }
         guard !processManager.isRunning(name: app.name) else { return }
@@ -450,7 +453,7 @@ final class AppModel: ObservableObject {
             $0.startedAt = Date()
             $0.backendRunning = app.needsSidecar
         }
-        pendingBrowserOpen.insert(app.name)
+        if openBrowser { pendingBrowserOpen.insert(app.name) }
         refreshProxyRoutes()
         refreshLauncher()
 

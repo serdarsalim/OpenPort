@@ -4,7 +4,10 @@ import Foundation
 final class ProcessManager {
     private var running: [String: Process] = [:]
     private var backends: [String: [Process]] = [:]
-    private var stopping: Set<String> = []
+    /// Processes we asked to die, by identity. Keyed by object, not app name: a Restart spawns
+    /// the replacement before the old leader has finished dying, and a name-keyed flag let the
+    /// old exit be read as the new one's (or the new one's crash be read as expected).
+    private var stopping: Set<ObjectIdentifier> = []
     private var logBuffers: [String: LogBuffer] = [:]
     private(set) var crashLogs: [String: String] = [:]  // name → last stderr on unexpected exit
 
@@ -69,15 +72,15 @@ final class ProcessManager {
         logBuffers[name] = buffer
 
         let frontend = makeProcess(directory: directory, env: env, command: command, logBuffer: buffer)
-        frontend.terminationHandler = { [weak self, name] _ in
+        frontend.terminationHandler = { [weak self, name] finished in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let unexpected = !self.stopping.contains(name)
-                self.stopping.remove(name)
+                let unexpected = self.stopping.remove(ObjectIdentifier(finished)) == nil
+                // A leader from a previous run dying late must not tear down its replacement:
+                // the new process, its backend and its log all live under the same name.
+                guard self.running[name] === finished else { return }
                 self.running.removeValue(forKey: name)
-                for sidecar in self.backends.removeValue(forKey: name) ?? [] where sidecar.isRunning {
-                    SystemClient.killTree(pid: sidecar.processIdentifier)
-                }
+                Self.killInBackground(self.backends.removeValue(forKey: name) ?? [])
                 if unexpected {
                     if let log = self.logBuffers[name]?.snapshot() {
                         self.crashLogs[name] = log
@@ -113,9 +116,7 @@ final class ProcessManager {
         } catch {
             // A spawn that never happens must not leave the row "starting" forever. Report it
             // through the same path as a crash so the row shows why.
-            for backend in backends.removeValue(forKey: name) ?? [] where backend.isRunning {
-                SystemClient.killTree(pid: backend.processIdentifier)
-            }
+            Self.killInBackground(backends.removeValue(forKey: name) ?? [])
             logBuffers.removeValue(forKey: name)
             crashLogs[name] = "OpenPort couldn't launch the process: \(error.localizedDescription)\n\(command)"
             onTerminated?(name)
@@ -125,24 +126,18 @@ final class ProcessManager {
     }
 
     func stop(name: String) {
-        stopping.insert(name)
         crashLogs.removeValue(forKey: name)
-        if let proc = running[name] { SystemClient.killTree(pid: proc.processIdentifier) }
-        running.removeValue(forKey: name)
-        logBuffers.removeValue(forKey: name)
-        for sidecar in backends.removeValue(forKey: name) ?? [] where sidecar.isRunning {
-            SystemClient.killTree(pid: sidecar.processIdentifier)
+        if let proc = running.removeValue(forKey: name) {
+            stopping.insert(ObjectIdentifier(proc))
+            Self.killInBackground([proc])
         }
+        logBuffers.removeValue(forKey: name)
+        Self.killInBackground(backends.removeValue(forKey: name) ?? [])
     }
 
     func stopAll() {
-        for name in running.keys { stopping.insert(name) }
-        for process in running.values where process.isRunning {
-            SystemClient.killTree(pid: process.processIdentifier)
-        }
-        for process in backends.values.flatMap({ $0 }) where process.isRunning {
-            SystemClient.killTree(pid: process.processIdentifier)
-        }
+        for process in running.values { stopping.insert(ObjectIdentifier(process)) }
+        Self.killInBackground(Array(running.values) + backends.values.flatMap { $0 })
         running.removeAll()
         backends.removeAll()
         logBuffers.removeAll()
@@ -156,8 +151,18 @@ final class ProcessManager {
             + backends.values.flatMap { $0 }.map(\.processIdentifier)
             + extraTrees)
             .filter { $0 > 0 }
-        for name in running.keys { stopping.insert(name) }
+        for process in running.values { stopping.insert(ObjectIdentifier(process)) }
         SystemClient.killTreesSync(pids: pids)
+    }
+
+    /// killTree walks the tree with one `pgrep -P` per process (~16ms each); a Next + Convex
+    /// stack is 20-odd processes, so doing it on the main actor froze the UI on every Stop.
+    private static func killInBackground(_ processes: [Process]) {
+        let pids = processes.filter(\.isRunning).map(\.processIdentifier)
+        guard !pids.isEmpty else { return }
+        Task.detached(priority: .userInitiated) {
+            for pid in pids { SystemClient.killTree(pid: pid) }
+        }
     }
 
     func isRunning(name: String) -> Bool {
@@ -327,15 +332,18 @@ final class ProcessManager {
             let errPipe = Pipe()
             process.standardOutput = outPipe
             process.standardError = errPipe
-            outPipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                buffer.append(text)
-            }
-            errPipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                buffer.append(text)
+            // At EOF the handler fires forever with empty data unless it removes itself — each
+            // exited process used to leave two threads spinning at ~1.7 cores between them,
+            // and enough Stop→Run cycles starved the very dev servers we were booting.
+            for pipe in [outPipe, errPipe] {
+                pipe.fileHandleForReading.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    guard !data.isEmpty else {
+                        handle.readabilityHandler = nil
+                        return
+                    }
+                    buffer.append(String(decoding: data, as: UTF8.self))
+                }
             }
         } else {
             process.standardOutput = FileHandle.nullDevice
