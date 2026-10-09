@@ -59,7 +59,7 @@ struct AppRowView: View {
                 } label: {
                     Label("Run in Terminal Tab", systemImage: "terminal")
                 }
-                .help("Run \(model.terminalCommand(for: app)) in a new tab — live output, Ctrl-C to stop")
+                .help("Run \(model.terminalCommand(for: app)) in a terminal tab — live output, Ctrl-C to stop")
             }
             if let cacheLabel {
                 Button {
@@ -218,9 +218,9 @@ struct AppRowView: View {
 
     private func runInTerminalTab() {
         guard let root = model.portfolioRoot else { return }
-        terminalStore.runInNewSession(title: app.folder,
-                                      cwd: root.appendingPathComponent(app.folder),
-                                      command: model.terminalCommand(for: app))
+        terminalStore.run(model.terminalCommand(for: app),
+                          title: app.folder,
+                          cwd: root.appendingPathComponent(app.folder))
     }
 
     /// The OpenPort tab this row's server runs in, if it was started from one.
@@ -232,7 +232,7 @@ struct AppRowView: View {
         if useExternalTerminal {
             model.openTerminal(for: app)
         } else if let root = model.portfolioRoot {
-            terminalStore.openSession(title: app.folder, cwd: root.appendingPathComponent(app.folder))
+            terminalStore.openOrFocusSession(title: app.folder, cwd: root.appendingPathComponent(app.folder))
         }
     }
 

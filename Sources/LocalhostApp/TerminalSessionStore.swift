@@ -25,8 +25,14 @@ final class TerminalSession: ObservableObject, Identifiable {
     let terminalView: LocalProcessTerminalView
     private let delegateProxy: ProcessDelegate
     private let initialTitle: String
-    /// The shell's current directory name, tracked so the title follows `cd`.
-    private var folder: String?
+    /// The shell's current directory (full path), tracked so the title follows `cd` and a
+    /// row's terminal button can find a tab already sitting in its project.
+    private(set) var currentDirectory: String?
+    private var folder: String? {
+        guard let currentDirectory else { return nil }
+        if currentDirectory == FileManager.default.homeDirectoryForCurrentUser.path { return "~" }
+        return (currentDirectory as NSString).lastPathComponent
+    }
     /// Whatever the shell itself asked for via an OSC title escape, if anything.
     private var oscTitle: String?
 
@@ -72,12 +78,22 @@ final class TerminalSession: ObservableObject, Identifiable {
         return fd >= 0 ? tcgetpgrp(fd) : -1
     }
 
-    func apply(job: TerminalJob?, folder: String?) {
-        guard job != self.job || folder != self.folder else { return }
+    func apply(job: TerminalJob?, directory: String?) {
+        guard job != self.job || directory != currentDirectory else { return }
         self.job = job
-        self.folder = folder
+        currentDirectory = directory
         updateTitle()
     }
+
+    /// The shell is at its prompt right now (checked live, not from the 2s scan), so typing
+    /// into it starts a command rather than feeding a running server's stdin.
+    var isAtPrompt: Bool {
+        let fg = foregroundGroup
+        return fg > 0 && fg == shellPID
+    }
+
+    /// Where the shell is, falling back to where the tab opened before the first scan.
+    var directoryPath: String { currentDirectory ?? cwd.path }
 
     /// Idle: the folder (or the shell's own OSC title). Busy: "folder:job", plus the port when
     /// the job serves one — the difference between "a terminal" and "the hubspot server".
@@ -146,12 +162,35 @@ final class TerminalSessionStore: ObservableObject {
         return session
     }
 
-    /// Open a tab in `cwd` and run `command` in it — a server you can watch, scroll and
-    /// Ctrl-C, with a real TTY. The tab names itself once the job is up.
-    func runInNewSession(title: String, cwd: URL, command: String) {
-        let session = openSession(title: title, cwd: cwd)
+    /// Run `command` in a tab in `cwd` — a server you can watch, scroll and Ctrl-C, with a
+    /// real TTY. Reuses an idle tab already in that folder; the tab names itself once the job
+    /// is up.
+    func run(_ command: String, title: String, cwd: URL) {
+        let session = idleSession(in: cwd) ?? openSession(title: title, cwd: cwd)
+        selectedTab = .session(session.id)
         session.run(command)
         Task { await refreshJobs() }
+    }
+
+    /// Focus a tab that's idle in `cwd`, or open one. The row's terminal button used to open
+    /// a new tab every click, so a project ended up with three tabs all called "nudge".
+    func openOrFocusSession(title: String, cwd: URL) {
+        if let existing = idleSession(in: cwd) {
+            selectedTab = .session(existing.id)
+        } else {
+            openSession(title: title, cwd: cwd)
+        }
+    }
+
+    private func idleSession(in cwd: URL) -> TerminalSession? {
+        let target = Self.canonical(cwd.path)
+        return sessions.first { $0.isAtPrompt && Self.canonical($0.directoryPath) == target }
+    }
+
+    /// lsof reports the resolved path; the portfolio root may arrive with a symlink or a
+    /// trailing slash. Compare like with like.
+    private static func canonical(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     func openHomeSession() {
@@ -229,15 +268,14 @@ final class TerminalSessionStore: ObservableObject {
         let shells = sessions.map { JobScanner.Shell(pid: $0.shellPID, foreground: $0.foregroundGroup) }
             .filter { $0.pid > 0 }
         guard !shells.isEmpty else { return }
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
         let snapshot = await Task.detached(priority: .utility) {
-            JobScanner.scan(shells: shells, home: home)
+            JobScanner.scan(shells: shells)
         }.value
         var changed = false
         for session in sessions {
             let found = snapshot[session.shellPID]
             if found?.job != session.job { changed = true }
-            session.apply(job: found?.job, folder: found?.folder)
+            session.apply(job: found?.job, directory: found?.directory)
         }
         // Rows observe the store, not each session: tell them when a tab starts or stops
         // serving a port so "terminal → jump to tab" stays current.
@@ -254,11 +292,11 @@ private enum JobScanner {
     }
 
     struct Result: Sendable {
-        let folder: String?
+        let directory: String?
         let job: TerminalJob?
     }
 
-    static func scan(shells: [Shell], home: String) -> [Int32: Result] {
+    static func scan(shells: [Shell]) -> [Int32: Result] {
         // 1. Whole process table once: pid → (pgid, command), plus the child map.
         var command: [Int32: String] = [:]
         var groupLeaderFallback: [Int32: Int32] = [:]  // pgid → lowest pid in it
@@ -318,14 +356,14 @@ private enum JobScanner {
 
         var result: [Int32: Result] = [:]
         for shell in shells.map(\.pid) {
-            let folder = cwdByPid[shell].map { $0 == home ? "~" : ($0 as NSString).lastPathComponent }
+            let directory = cwdByPid[shell]
             guard let root = jobRoot[shell], let cmd = command[root] else {
-                result[shell] = Result(folder: folder, job: nil)
+                result[shell] = Result(directory: directory, job: nil)
                 continue
             }
             let ports = (tree[shell] ?? []).reduce(into: Set<Int>()) { $0.formUnion(portsByPid[$1] ?? []) }
             result[shell] = Result(
-                folder: folder,
+                directory: directory,
                 job: TerminalJob(label: CommandLabel.label(for: cmd), command: cmd, ports: ports.sorted())
             )
         }
