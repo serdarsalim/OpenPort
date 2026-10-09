@@ -30,7 +30,7 @@ struct AppRowView: View {
     @State private var showPortsPopover = false
 
     private var takenPorts: Set<Int> {
-        Set(model.apps.filter { $0.name != app.name }.map { $0.port })
+        Set(model.activeApps.filter { $0.name != app.name }.map { $0.port })
     }
 
 
@@ -386,19 +386,10 @@ struct AppRowView: View {
                     .foregroundStyle(.orange)
                     .help("Another project is using port \(app.port)")
             case .free:
-                // A stopped row's status cell is dead space — on hover it becomes the
-                // archive control, so decluttering never means a trip to Settings.
-                if isHovered {
-                    Button { model.archive(app: app) } label: {
-                        Label("archive", systemImage: "archivebox")
-                            .font(.caption)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .help("Hide this project in the Archived section at the bottom of the list")
-                } else {
-                    Text("—").foregroundStyle(.tertiary).font(.caption)
-                }
+                // Archive lives in the right-click menu. Surfacing it here on hover made the
+                // status column flicker a destructive-looking control across every row the
+                // pointer crossed.
+                Text("—").foregroundStyle(.tertiary).font(.caption)
             }
         }
         .frame(width: 110, alignment: .leading)

@@ -19,6 +19,12 @@ struct PortStore {
         defaults.set(ports, forKey: key)
     }
 
+    func release(_ name: String) {
+        var ports = load()
+        guard ports.removeValue(forKey: name) != nil else { return }
+        save(ports)
+    }
+
     /// Assigns ports to app names. For new apps, prefers the port hardcoded in
     /// their dev script (scriptPorts) over auto-incrementing from 3001.
     ///
@@ -26,22 +32,30 @@ struct PortStore {
     /// the store. A project that declares 3006 and runs its command verbatim genuinely binds
     /// 3006 — an auto-assigned 3001 left over from before the declaration would just make us
     /// watch the wrong port forever and report the app as crashed while it happily serves.
+    ///
+    /// Only live projects hold a number. Archived projects and names no longer on disk (a
+    /// deleted folder, nudge's pre-split "nudge" row) are dropped from the store, so their
+    /// ports go back to the pool instead of blocking a new project's hint forever.
     func assign(
         to appNames: [String],
         scriptPorts: [String: Int] = [:],
-        declaredPorts: [String: Int] = [:]
+        declaredPorts: [String: Int] = [:],
+        archived: Set<String> = []
     ) -> [String: Int] {
         let stored = load()
-        var ports = stored
+        let live = Set(appNames).subtracting(archived)
+        // An empty scan is more likely an unmounted portfolio than an empty one — pruning on
+        // it would reshuffle every port the moment the drive comes back.
+        var ports = appNames.isEmpty ? stored : stored.filter { live.contains($0.key) }
 
-        for (name, port) in declaredPorts where ports[name] != port {
+        for (name, port) in declaredPorts where live.contains(name) && ports[name] != port {
             ports[name] = port
         }
 
         var used = Set(ports.values)
         var next = 3001
 
-        for name in appNames {
+        for name in appNames where live.contains(name) {
             guard ports[name] == nil else { continue }
 
             if let hint = scriptPorts[name], !used.contains(hint) {

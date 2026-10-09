@@ -98,8 +98,8 @@ final class AppModel: ObservableObject {
     // MARK: - Archive
 
     /// Projects hidden from the dashboard, menu bar, go/ links, and LAN launcher. The scan
-    /// still sees them (so unarchiving is instant and ports stay reserved) — they're folded
-    /// into a collapsed section instead of cluttering the list.
+    /// still sees them so unarchiving is instant, but they hold no port: an archived project's
+    /// number goes back to the pool, and unarchiving assigns one fresh.
     @Published private(set) var archivedNames: Set<String> = []
 
     var activeApps: [DevApp] { apps.filter { !archivedNames.contains($0.name) } }
@@ -111,6 +111,8 @@ final class AppModel: ObservableObject {
         if app.isRunning || app.portStatus == .detached { stop(app: app) }
         archivedNames.insert(app.name)
         defaults.set(Array(archivedNames).sorted(), forKey: "archivedApps")
+        portStore.release(app.name)
+        update(app.name) { $0.port = 0 }
         refreshProxyRoutes()
         refreshLauncher()
     }
@@ -120,6 +122,8 @@ final class AppModel: ObservableObject {
         defaults.set(Array(archivedNames).sorted(), forKey: "archivedApps")
         refreshProxyRoutes()
         refreshLauncher()
+        // It has no port until the scan assigns one.
+        Task { await refresh(quiet: true) }
     }
 
     // MARK: - Status polling
@@ -198,14 +202,22 @@ final class AppModel: ObservableObject {
     }
 
     private var refreshInFlight = false
+    /// A refresh asked for while one was running. Dropping it meant an unarchive, or a ⌘R
+    /// during a quiet poll, waited up to 12s to show; now it runs right after.
+    private var refreshQueued = false
 
     func refresh(quiet: Bool = false) async {
-        guard let root = portfolioRoot, !refreshInFlight else { return }
+        guard let root = portfolioRoot else { return }
+        guard !refreshInFlight else { refreshQueued = true; return }
         refreshInFlight = true
         if !quiet { isLoading = true }
         defer {
             refreshInFlight = false
             if !quiet { isLoading = false }
+            if refreshQueued {
+                refreshQueued = false
+                Task { await refresh(quiet: true) }
+            }
         }
 
         // The scan reads every package.json / openport.json / .env under the portfolio, and the
@@ -226,12 +238,13 @@ final class AppModel: ObservableObject {
         let scannedByName = Dictionary(scanned.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
         let scriptPorts = scannedByName.compactMapValues(\.scriptPort)
         let declaredPorts = scannedByName.compactMapValues(\.declaredPort)
-        let ports = portStore.assign(to: appNames, scriptPorts: scriptPorts, declaredPorts: declaredPorts)
+        let ports = portStore.assign(to: appNames, scriptPorts: scriptPorts, declaredPorts: declaredPorts,
+                                     archived: archivedNames)
         let goAliases = goLinkStore.load()
 
         async let portTask = withTaskGroup(of: (String, Bool).self) { group in
             for name in appNames {
-                let port = ports[name] ?? 3000
+                let port = ports[name] ?? 0  // archived: no port, never probed
                 group.addTask { (name, SystemClient.isPortListening(port)) }
             }
             var r: [String: Bool] = [:]
@@ -306,7 +319,7 @@ final class AppModel: ObservableObject {
         apps = appNames.map { name in
             let scannedApp = scannedByName[name]
             let folder = scannedApp?.folder ?? name
-            let assignedPort = ports[name] ?? 3000
+            let assignedPort = ports[name] ?? 0
             let weStartedIt = runningNames.contains(name)
             let assignedPortListening = portListening[name] ?? false
             let listenersForApp = listenersByRow[name] ?? []

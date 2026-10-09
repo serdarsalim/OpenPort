@@ -450,7 +450,7 @@ struct DashboardView: View {
     }
 }
 
-/// A folded-away project: name and port only, with one click to bring it back. Deliberately
+/// A folded-away project: just its name (it holds no port), with one click to bring it back. Deliberately
 /// inert — no play button, no actions — so the archive reads as storage, not as a second list.
 private struct ArchivedRowView: View {
     let app: DevApp
@@ -462,9 +462,6 @@ private struct ArchivedRowView: View {
             Color.clear.frame(width: 28)
             Text(app.name)
                 .foregroundStyle(.secondary)
-            Text(verbatim: "\(app.port)")
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(.tertiary)
             Spacer()
             if isHovered {
                 Button { model.unarchive(app.name) } label: {
