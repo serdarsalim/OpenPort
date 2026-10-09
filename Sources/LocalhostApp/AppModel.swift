@@ -42,7 +42,7 @@ final class AppModel: ObservableObject {
                     $0.crashLog = crashLog
                 }
                 self.refreshLauncher()
-                let ports = [app.detectedPort ?? app.port] + app.sidecarTargets.compactMap(\.port)
+                let ports = [app.detectedPort ?? app.port]
                 Task { [weak self] in
                     // The crashed leader's children may outlive it and still hold the ports;
                     // retrying into EADDRINUSE would just burn the one retry for nothing.
@@ -201,30 +201,24 @@ final class AppModel: ObservableObject {
             if !quiet { isLoading = false }
         }
 
-        let scanner = AppScanner(portfolioRoot: root)
-        let scanned = scanner.scanWithPorts()
+        // The scan reads every package.json / openport.json / .env under the portfolio, and the
+        // Node lookup lists nvm + Homebrew — file IO that has no business on the main thread
+        // every 12 seconds.
+        let (scanned, nodeNotes) = await Task.detached(priority: .utility) { () -> ([AppScanner.ScannedApp], [String: String]) in
+            let scanned = AppScanner(portfolioRoot: root).scanWithPorts()
+            var notes: [String: String] = [:]
+            for item in scanned {
+                notes[item.name] = NodeResolver.resolve(
+                    directory: root.appendingPathComponent(item.folder),
+                    convexCompat: item.backendKind == .convex
+                )?.note
+            }
+            return (scanned, notes)
+        }.value
         let appNames = scanned.map(\.name)
-        let scriptPorts = Dictionary(uniqueKeysWithValues: scanned.compactMap { item -> (String, Int)? in
-            guard let p = item.scriptPort else { return nil }
-            return (item.name, p)
-        })
-        let devScripts = Dictionary(uniqueKeysWithValues: scanned.compactMap { item -> (String, String)? in
-            guard let s = item.devScript else { return nil }
-            return (item.name, s)
-        })
-        let devScriptNames = Dictionary(uniqueKeysWithValues: scanned.compactMap { item -> (String, String)? in
-            guard let n = item.devScriptName else { return nil }
-            return (item.name, n)
-        })
-        let sniffScripts = Dictionary(uniqueKeysWithValues: scanned.compactMap { item -> (String, String)? in
-            guard let s = item.sniffScript else { return nil }
-            return (item.name, s)
-        })
-        let scannedByName = Dictionary(uniqueKeysWithValues: scanned.map { ($0.name, $0) })
-        let declaredPorts = Dictionary(uniqueKeysWithValues: scanned.compactMap { item -> (String, Int)? in
-            guard let p = item.declaredPort else { return nil }
-            return (item.name, p)
-        })
+        let scannedByName = Dictionary(scanned.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+        let scriptPorts = scannedByName.compactMapValues(\.scriptPort)
+        let declaredPorts = scannedByName.compactMapValues(\.declaredPort)
         let ports = portStore.assign(to: appNames, scriptPorts: scriptPorts, declaredPorts: declaredPorts)
         let goAliases = goLinkStore.load()
         let runningNames = Set(appNames.filter { processManager.isRunning(name: $0) })
@@ -246,7 +240,7 @@ final class AppModel: ObservableObject {
         // Rebuilding the array must not amnesia away state that only lives in it: a crash
         // (status + log) and the start timestamp would otherwise vanish on the next quiet
         // poll refresh, 12 seconds after the user needed to see them.
-        let previous = Dictionary(uniqueKeysWithValues: apps.map { ($0.name, $0) })
+        let previous = Dictionary(apps.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
 
         // Group all detected listeners by their cwd. One cwd may have many ports.
         var detectedByDir: [String: [DetectedServer]] = [:]
@@ -254,20 +248,65 @@ final class AppModel: ObservableObject {
             detectedByDir[entry.directory, default: []].append(entry)
         }
 
-        let appDirSet = Set(appNames.map { root.appendingPathComponent($0).path })
+        // Hand each folder's listeners to its rows. A folder with one row keeps the old rule:
+        // everything listening in it belongs to that row. A folder with several rows (one per
+        // openport.json target) splits them: a listener on a row's declared port is that
+        // row's; the rest (nudge's local Convex backend on 3210, its dashboard on 6790) go to
+        // the first sibling that is up. If no sibling is up they're leftovers from a dead run
+        // and surface in the orphan list, where they can be killed.
+        var rowsByFolder: [String: [String]] = [:]
+        for item in scanned { rowsByFolder[item.folder, default: []].append(item.name) }
+        var listenersByRow: [String: [DetectedServer]] = [:]
+        var unclaimed: [DetectedServer] = []
+        for (folder, rows) in rowsByFolder {
+            let listeners = detectedByDir[root.appendingPathComponent(folder).path] ?? []
+            guard rows.count > 1 else {
+                if let only = rows.first { listenersByRow[only] = listeners }
+                continue
+            }
+            var leftovers: [DetectedServer] = []
+            for listener in listeners {
+                if let owner = rows.first(where: { declaredPorts[$0] == listener.port }) {
+                    listenersByRow[owner, default: []].append(listener)
+                } else {
+                    leftovers.append(listener)
+                }
+            }
+            guard !leftovers.isEmpty else { continue }
+            let active = rows.first { runningNames.contains($0) || listenersByRow[$0]?.isEmpty == false }
+            if let active { listenersByRow[active, default: []].append(contentsOf: leftovers) }
+            else { unclaimed.append(contentsOf: leftovers) }
+        }
+
+        let appDirSet = Set(scanned.map { root.appendingPathComponent($0.folder).path })
+        let firstRowOfFolder = Set(rowsByFolder.values.compactMap(\.first))
 
         apps = appNames.map { name in
-            let appDir = root.appendingPathComponent(name).path
+            let scannedApp = scannedByName[name]
+            let folder = scannedApp?.folder ?? name
             let assignedPort = ports[name] ?? 3000
             let weStartedIt = runningNames.contains(name)
             let assignedPortListening = portListening[name] ?? false
-            let listenersForApp = detectedByDir[appDir] ?? []
-            let goAlias = goAliases[name] ?? GoLinkStore.defaultAlias(for: name)
+            let listenersForApp = listenersByRow[name] ?? []
+            // The first instance of a multi-target project inherits the folder's alias, so
+            // go/nudge keeps landing where it always did.
+            let inheritsFolderAlias = folder != name && firstRowOfFolder.contains(name)
+            let goAlias = goAliases[name]
+                ?? (inheritsFolderAlias ? goAliases[folder] : nil)
+                ?? GoLinkStore.defaultAlias(for: inheritsFolderAlias ? folder : name)
 
-            // Pick a primary listener: prefer the one matching the assigned port,
-            // otherwise the lowest-numbered port.
-            let primary: DetectedServer? = listenersForApp.first(where: { $0.port == assignedPort })
-                ?? listenersForApp.min(by: { $0.port < $1.port })
+            // Pick a primary listener. A declared port is the only one a row may claim —
+            // adopting "the lowest port in this folder" is how nudge's row once grabbed its
+            // native sibling's 3013 while hubspot was still booting on 3012, then opened the
+            // browser on the wrong stack. Sniffed projects keep the adoption fallback: a Vite
+            // that ignored PORT and bound 5173 is still this row's server.
+            let primary: DetectedServer?
+            if let declared = declaredPorts[name] {
+                primary = listenersForApp.first { $0.port == declared }
+            } else {
+                primary = listenersForApp.first(where: { $0.port == assignedPort })
+                    ?? listenersForApp.min(by: { $0.port < $1.port })
+            }
 
             let extras: [DetectedPort] = listenersForApp
                 .filter { $0.port != primary?.port || $0.pid != primary?.pid }
@@ -283,15 +322,19 @@ final class AppModel: ObservableObject {
             } else if weStartedIt {
                 // Our process is alive but the assigned port isn't bound. Either it's still
                 // booting (Convex + Next take ~20s cold) or it bound a different port (Vite
-                // ignores PORT env). Adopt any listener in this app's directory; otherwise
-                // it's starting — a crash is only ever declared by the termination handler.
+                // ignores PORT env). Adopt the primary listener; otherwise it's starting — a
+                // crash is only ever declared by the termination handler.
                 if let server = primary {
-                    status = .running; detectedPort = server.port; externalPID = nil
+                    status = .running
+                    detectedPort = server.port == assignedPort ? nil : server.port
+                    externalPID = nil
                 } else {
                     status = .starting; detectedPort = nil; externalPID = nil
                 }
             } else if let server = primary {
-                status = .detached; detectedPort = server.port; externalPID = server.pid
+                status = .detached
+                detectedPort = server.port == assignedPort ? nil : server.port
+                externalPID = server.pid
             } else if assignedPortListening {
                 status = .external; detectedPort = nil; externalPID = nil
             } else if previous[name]?.portStatus == .crashed {
@@ -306,43 +349,39 @@ final class AppModel: ObservableObject {
                 status = .free; detectedPort = nil; externalPID = nil
             }
 
-            let scannedApp = scannedByName[name]
-            let nodeNote: String? = NodeResolver.resolve(
-                directory: root.appendingPathComponent(name),
-                convexCompat: scannedApp?.backendKind == .convex
-            )?.note
-
             return DevApp(
                 name: name,
+                folder: folder,
+                instance: scannedApp?.instance,
                 port: assignedPort,
                 isRunning: weStartedIt,
                 portStatus: status,
                 detectedPort: detectedPort,
                 externalPID: externalPID,
                 goAlias: goAlias,
-                devScript: devScripts[name],
-                devScriptName: devScriptNames[name],
-                sniffScript: sniffScripts[name],
+                devScript: scannedApp?.devScript,
+                devScriptName: scannedApp?.devScriptName,
+                sniffScript: scannedApp?.sniffScript,
                 backendKind: scannedApp?.backendKind,
                 backendBundled: scannedApp?.backendBundled ?? false,
                 backendNeedsLocal: scannedApp?.backendNeedsLocal ?? false,
                 backendCommand: scannedApp?.backendCommand,
                 backendRunning: processManager.isBackendRunning(name: name),
-                nodeNote: nodeNote,
+                nodeNote: nodeNotes[name],
                 crashLog: status == .crashed ? previous[name]?.crashLog : nil,
                 startedAt: weStartedIt ? previous[name]?.startedAt : nil,
                 extraPorts: extras,
-                runTargets: scannedApp?.runTargets ?? [],
+                runTarget: scannedApp?.runTarget,
                 declaredFramework: scannedApp?.framework,
                 declaredCaches: scannedApp?.cacheDirs ?? []
             )
         }
 
-        // Anything left over — listeners whose cwd isn't a known app folder.
-        // System daemons, installed Mac apps, and OpenPort itself are filtered
-        // out: killing those breaks Continuity, Tailscale, ssh tunnels, etc.
-        orphans = detected
-            .filter { !appDirSet.contains($0.directory) }
+        // Anything left over — listeners whose cwd isn't a known app folder, plus a
+        // multi-target folder's listeners that no running instance owns. System daemons,
+        // installed Mac apps, and OpenPort itself are filtered out: killing those breaks
+        // Continuity, Tailscale, ssh tunnels, etc.
+        orphans = (detected.filter { !appDirSet.contains($0.directory) } + unclaimed)
             .filter { !Self.isSystemOrInstalledApp($0) }
             .map { OrphanPort(pid: $0.pid, port: $0.port, directory: $0.directory, command: $0.command) }
             .sorted { $0.port < $1.port }
@@ -409,7 +448,7 @@ final class AppModel: ObservableObject {
             $0.isRunning = true
             $0.portStatus = .starting
             $0.startedAt = Date()
-            $0.backendRunning = app.needsSidecar || !app.sidecarTargets.isEmpty
+            $0.backendRunning = app.needsSidecar
         }
         pendingBrowserOpen.insert(app.name)
         refreshProxyRoutes()
@@ -421,7 +460,7 @@ final class AppModel: ObservableObject {
         // spawn waits until the app's ports are genuinely free, sweeping any half-dead
         // holder first — the same discipline restart() has always had. The common case
         // (ports already free) costs one connect() round before spawning.
-        let ports = [app.port] + app.sidecarTargets.compactMap(\.port)
+        let ports = [app.port]
         Task {
             let busy = await Task.detached(priority: .userInitiated) {
                 ports.contains { SystemClient.isPortListening($0) }
@@ -450,12 +489,11 @@ final class AppModel: ObservableObject {
         processManager.start(
             name: app.name,
             port: app.port,
-            in: root.appendingPathComponent(app.name),
+            in: root.appendingPathComponent(app.folder),
             devScript: app.devScript,
             devScriptName: app.devScriptName,
             sniffScript: app.sniffScript,
-            primaryCommand: app.primaryTarget?.command,
-            sidecars: app.sidecarTargets,
+            primaryCommand: app.runTarget?.command,
             backendCommand: app.needsSidecar ? app.backendCommand : nil,
             convexCompat: app.backendKind == .convex,
             bindHost: launcherEnabled,
@@ -479,11 +517,10 @@ final class AppModel: ObservableObject {
 
     private func stopAndRelaunch(app: DevApp, wipeCaches: Bool) {
         guard let root = portfolioRoot else { return }
-        let dir = root.appendingPathComponent(app.name)
+        let dir = root.appendingPathComponent(app.folder)
         let framework = ProcessManager.detectFramework(devScript: app.sniffScript ?? app.devScript, declared: app.declaredFramework)
         let extraCaches = app.declaredCaches
         let port = app.detectedPort ?? app.port
-        let sidecarPorts = app.sidecarTargets.compactMap(\.port)
         let extraPids = app.extraPorts.map(\.pid)
         let externalPID = app.externalPID
 
@@ -505,13 +542,11 @@ final class AppModel: ObservableObject {
                 if let externalPID { SystemClient.killTree(pid: externalPID) }
                 for pid in extraPids { SystemClient.killTree(pid: pid) }
                 SystemClient.killPort(port)
-                for sidecarPort in sidecarPorts { SystemClient.killPort(sidecarPort) }
                 if wipeCaches {
                     ProcessManager.clearCaches(in: dir, framework: framework, extra: extraCaches)
                 }
                 for _ in 0..<20 {
-                    let busy = ([port] + sidecarPorts).contains { SystemClient.isPortListening($0) }
-                    if !busy { break }
+                    if !SystemClient.isPortListening(port) { break }
                     try? await Task.sleep(nanoseconds: 500_000_000)
                 }
             }.value
@@ -541,16 +576,12 @@ final class AppModel: ObservableObject {
         }
         let port = app.detectedPort ?? app.port
         let extraPids = app.extraPorts.map(\.pid)
-        // Declared sidecar ports are swept too: lsof only sees a target that was still up when
-        // we last scanned, and a half-dead second stack holding 3013 blocks the next Run.
-        let sidecarPorts = app.sidecarTargets.compactMap(\.port)
         update(app.name) { $0.isRunning = false; $0.portStatus = .free; $0.detectedPort = nil; $0.externalPID = nil; $0.backendRunning = false; $0.crashLog = nil; $0.extraPorts = [] }
         refreshProxyRoutes()
         refreshLauncher()
         Task.detached {
             for pid in extraPids { SystemClient.killTree(pid: pid) }
             SystemClient.killPort(port)
-            for sidecarPort in sidecarPorts { SystemClient.killPort(sidecarPort) }
         }
     }
 
@@ -658,17 +689,17 @@ final class AppModel: ObservableObject {
 
     func openTerminal(for app: DevApp) {
         guard let root = portfolioRoot else { return }
-        SystemClient.openTerminal(at: root.appendingPathComponent(app.name))
+        SystemClient.openTerminal(at: root.appendingPathComponent(app.folder))
     }
 
     func openEditor(for app: DevApp) {
         guard let root = portfolioRoot else { return }
-        SystemClient.openVSCode(at: root.appendingPathComponent(app.name))
+        SystemClient.openVSCode(at: root.appendingPathComponent(app.folder))
     }
 
     func openFinder(for app: DevApp) {
         guard let root = portfolioRoot else { return }
-        SystemClient.openFinder(at: root.appendingPathComponent(app.name))
+        SystemClient.openFinder(at: root.appendingPathComponent(app.folder))
     }
 
     private func refreshProxyRoutes() {

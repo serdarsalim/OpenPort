@@ -5,13 +5,10 @@ struct AppScanner: Sendable {
 
     private let excluded: Set<String> = ["dev-dashboard", "localhost-3000", ".git", "node_modules"]
 
-    /// Returns app names in sorted order.
-    func scan() -> [String] {
-        scanWithPorts().map(\.name)
-    }
-
     struct ScannedApp: Sendable {
-        let name: String
+        let name: String                // row key: folder, or "folder:instance" for multi-target projects
+        let folder: String              // project directory under the portfolio root
+        let instance: String?           // declared target label when the folder has several
         let scriptPort: Int?
         let devScript: String?
         let devScriptName: String?      // npm script name to run for the frontend (dev or dev:frontend)
@@ -20,14 +17,15 @@ struct AppScanner: Sendable {
         let backendBundled: Bool        // the frontend dev script already starts the backend
         let backendNeedsLocal: Bool     // backend runs as a local process (vs a cloud connection)
         let backendCommand: String?     // sidecar command to spawn when the backend isn't bundled
-        let runTargets: [RunTarget]     // declared in openport.json; empty = inferred from package.json
+        let runTarget: RunTarget?       // declared in openport.json; nil = inferred from package.json
         let framework: String?          // declared framework, overrides dev-script sniffing
         let cacheDirs: [String]         // declared build caches to wipe on a clean restart
         /// A declared port is the truth, not a hint — it overwrites a stored auto-assignment.
-        var declaredPort: Int? { runTargets.first?.port }
+        var declaredPort: Int? { runTarget?.port }
     }
 
-    /// Returns app names and any port hardcoded in their dev script.
+    /// Returns one entry per runnable thing: a plain project is one row, a project whose
+    /// openport.json declares N run targets is N rows sharing a folder.
     func scanWithPorts() -> [ScannedApp] {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(
@@ -36,10 +34,12 @@ struct AppScanner: Sendable {
             options: [.skipsHiddenFiles]
         ) else { return [] }
 
-        return entries.compactMap { url -> ScannedApp? in
+        // Folders sort alphabetically; a folder's instances keep their openport.json order, so
+        // the first declared target is listed (and treated) first.
+        let groups = entries.compactMap { url -> [ScannedApp]? in
             guard (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { return nil }
-            let name = url.lastPathComponent
-            guard !excluded.contains(name) else { return nil }
+            let folder = url.lastPathComponent
+            guard !excluded.contains(folder) else { return nil }
 
             let pkgPath = url.appendingPathComponent("package.json")
             guard fm.fileExists(atPath: pkgPath.path),
@@ -49,6 +49,7 @@ struct AppScanner: Sendable {
             let scripts = (pkg["scripts"] as? [String: Any]) ?? [:]
 
             let config = readConfig(in: url)
+            let targets = config?.runTargets ?? []
 
             // Prefer "dev"; fall back to "dev:frontend" for split frontend/backend setups.
             // A project that declares its own run targets doesn't need either.
@@ -60,32 +61,48 @@ struct AppScanner: Sendable {
             } else if let s = scripts["dev:frontend"] as? String {
                 devScriptName = "dev:frontend"
                 devScript = s
-            } else if config?.runTargets.isEmpty == false {
+            } else if !targets.isEmpty {
                 devScriptName = nil
                 devScript = nil
             } else {
                 return nil
             }
+            let sniffScript = devScript.map { Self.expandScriptReferences($0, scripts: scripts) }
 
             // An explicit backend declaration wins outright. Otherwise we sniff, as before.
-            let backend = config?.backend
+            let projectBackend = config?.backend
                 ?? detectBackend(in: url, devScript: devScript ?? "", scripts: scripts)
 
-            return ScannedApp(
-                name: name,
-                scriptPort: config?.runTargets.first?.port ?? devScript.flatMap(extractPort),
-                devScript: devScript,
-                devScriptName: devScriptName,
-                sniffScript: devScript.map { Self.expandScriptReferences($0, scripts: scripts) },
-                backendKind: backend.kind,
-                backendBundled: backend.bundled,
-                backendNeedsLocal: backend.needsLocal,
-                backendCommand: backend.command,
-                runTargets: config?.runTargets ?? [],
-                framework: config?.framework,
-                cacheDirs: config?.cacheDirs ?? []
-            )
-        }.sorted { $0.name < $1.name }
+            func entry(name: String, instance: String?, target: DeclaredTarget?) -> ScannedApp {
+                // A target can override the project's backend and caches: nudge's native stack
+                // talks to a cloud deployment and builds into .next-native, its hubspot stack
+                // runs a local backend and builds into .next. Clean-restarting one must not wipe
+                // the cache the other is serving from.
+                let backend = target?.backend ?? projectBackend
+                return ScannedApp(
+                    name: name,
+                    folder: folder,
+                    instance: instance,
+                    scriptPort: target?.target.port ?? devScript.flatMap(extractPort),
+                    devScript: devScript,
+                    devScriptName: devScriptName,
+                    sniffScript: sniffScript,
+                    backendKind: backend.kind,
+                    backendBundled: backend.bundled,
+                    backendNeedsLocal: backend.needsLocal,
+                    backendCommand: backend.command,
+                    runTarget: target?.target,
+                    framework: config?.framework,
+                    cacheDirs: target?.caches ?? config?.cacheDirs ?? []
+                )
+            }
+
+            if targets.count > 1 {
+                return targets.map { entry(name: "\(folder):\($0.target.name)", instance: $0.target.name, target: $0) }
+            }
+            return [entry(name: folder, instance: nil, target: targets.first)]
+        }
+        return groups.sorted { $0[0].folder < $1[0].folder }.flatMap { $0 }
     }
 
     private struct BackendInfo {
@@ -95,8 +112,14 @@ struct AppScanner: Sendable {
         var command: String?
     }
 
+    private struct DeclaredTarget {
+        var target: RunTarget
+        var backend: BackendInfo?
+        var caches: [String]?
+    }
+
     private struct ProjectConfig {
-        var runTargets: [RunTarget]
+        var runTargets: [DeclaredTarget]
         var backend: BackendInfo?
         var framework: String?
         var cacheDirs: [String]
@@ -110,57 +133,63 @@ struct AppScanner: Sendable {
     /// ```json
     /// {
     ///   "run": [
-    ///     { "name": "hubspot", "command": "npm run dev:hubspot", "port": 3012 },
-    ///     { "name": "native",  "command": "npm run dev:native",  "port": 3013 }
+    ///     { "name": "hubspot", "command": "npm run dev:hubspot", "port": 3012, "caches": [".next"] },
+    ///     { "name": "native",  "command": "npm run dev:native",  "port": 3013, "caches": [".next-native"],
+    ///       "backend": { "kind": "convex", "local": false } }
     ///   ],
     ///   "backend": { "kind": "convex", "bundled": true, "local": true },
-    ///   "framework": "next",
-    ///   "caches": [".next", ".next-native"]
+    ///   "framework": "next"
     /// }
     /// ```
     ///
-    /// The first `run` entry owns the row's port and status; the rest start with it and stop
-    /// with it. Every key is optional — a malformed file falls back to the old sniffing rather
-    /// than hiding the project.
+    /// One target → one row named after the folder. Several → one row each ("nudge:hubspot"),
+    /// independently runnable. `backend` and `caches` inside a target override the project's.
+    /// Every key is optional — a malformed file falls back to the old sniffing rather than
+    /// hiding the project.
     private func readConfig(in url: URL) -> ProjectConfig? {
         let path = url.appendingPathComponent("openport.json")
         guard let data = try? Data(contentsOf: path),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
 
-        let targets: [RunTarget] = (root["run"] as? [[String: Any]] ?? []).compactMap { entry in
+        var seenNames = Set<String>()
+        let targets: [DeclaredTarget] = (root["run"] as? [[String: Any]] ?? []).compactMap { entry in
             guard let command = (entry["command"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines), !command.isEmpty
             else { return nil }
-            let name = (entry["name"] as? String)?
+            let declared = (entry["name"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            return RunTarget(
-                name: (name?.isEmpty == false ? name! : command),
-                command: command,
-                port: entry["port"] as? Int
-            )
-        }
-
-        var backend: BackendInfo?
-        if let raw = root["backend"] as? [String: Any] {
-            let kind = (raw["kind"] as? String).flatMap { BackendKind(rawValue: $0.lowercased()) }
-            let command = (raw["command"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            backend = BackendInfo(
-                kind: kind,
-                bundled: raw["bundled"] as? Bool ?? false,
-                // Default true only when a kind is declared: saying "convex" and nothing else
-                // means a real backend exists, and claiming it's cloud-hosted would be a guess.
-                needsLocal: raw["local"] as? Bool ?? (kind != nil),
-                command: (command?.isEmpty == false) ? command : nil
+            var name = (declared?.isEmpty == false ? declared! : CommandLabel.label(for: command))
+            // Names key rows, ports and the process table — a duplicate would make two rows
+            // fight over one process. Disambiguate rather than drop the target.
+            if seenNames.contains(name) { name += "-\(seenNames.count + 1)" }
+            seenNames.insert(name)
+            return DeclaredTarget(
+                target: RunTarget(name: name, command: command, port: entry["port"] as? Int),
+                backend: (entry["backend"] as? [String: Any]).map(Self.parseBackend),
+                caches: entry["caches"] as? [String]
             )
         }
 
         return ProjectConfig(
             runTargets: targets,
-            backend: backend,
+            backend: (root["backend"] as? [String: Any]).map(Self.parseBackend),
             framework: (root["framework"] as? String)?.lowercased(),
             cacheDirs: (root["caches"] as? [String]) ?? []
+        )
+    }
+
+    private static func parseBackend(_ raw: [String: Any]) -> BackendInfo {
+        let kind = (raw["kind"] as? String).flatMap { BackendKind(rawValue: $0.lowercased()) }
+        let command = (raw["command"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return BackendInfo(
+            kind: kind,
+            bundled: raw["bundled"] as? Bool ?? false,
+            // Default true only when a kind is declared: saying "convex" and nothing else
+            // means a real backend exists, and claiming it's cloud-hosted would be a guess.
+            needsLocal: raw["local"] as? Bool ?? (kind != nil),
+            command: (command?.isEmpty == false) ? command : nil
         )
     }
 

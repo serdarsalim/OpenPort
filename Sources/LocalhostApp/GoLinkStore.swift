@@ -23,7 +23,9 @@ struct GoLinkStore {
         save(links)
     }
 
+    /// "nudge:native" → "nudge-native": a colon in go/nudge:native reads as a URL scheme
+    /// or port to half the tools that see it.
     static func defaultAlias(for appName: String) -> String {
-        appName.lowercased()
+        appName.lowercased().replacingOccurrences(of: ":", with: "-")
     }
 }

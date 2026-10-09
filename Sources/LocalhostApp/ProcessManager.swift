@@ -18,7 +18,6 @@ final class ProcessManager {
         devScriptName: String? = nil,
         sniffScript: String? = nil,
         primaryCommand: String? = nil,
-        sidecars: [RunTarget] = [],
         backendCommand: String? = nil,
         convexCompat: Bool = false,
         bindHost: Bool = false,
@@ -91,20 +90,14 @@ final class ProcessManager {
             }
         }
 
-        // Everything that runs alongside the primary: declared sidecar targets first, then the
-        // sniffed backend command. Each gets its own PORT so a target that reads the env var
-        // doesn't inherit the primary's port and collide with it.
-        var companions: [(command: String, port: Int?)] = sidecars.map { ($0.command, $0.port) }
-        if let backendCommand { companions.append((backendCommand, nil)) }
-
-        for companion in companions {
-            var companionEnv = env
-            if let companionPort = companion.port {
-                companionEnv["PORT"] = "\(companionPort)"
-                companionEnv["VITE_PORT"] = "\(companionPort)"
-            }
-            let process = makeProcess(directory: directory, env: companionEnv,
-                                      command: "exec \(companion.command)", logBuffer: buffer)
+        // A backend that isn't bundled into the dev script (`npm run dev:backend`) runs beside
+        // the frontend and dies with it. It must not inherit the frontend's PORT.
+        if let backendCommand {
+            var backendEnv = env
+            backendEnv.removeValue(forKey: "PORT")
+            backendEnv.removeValue(forKey: "VITE_PORT")
+            let process = makeProcess(directory: directory, env: backendEnv,
+                                      command: "exec \(backendCommand)", logBuffer: buffer)
             process.terminationHandler = { [weak self, name] finished in
                 Task { @MainActor [weak self] in
                     self?.backends[name]?.removeAll { $0 === finished }
@@ -115,7 +108,19 @@ final class ProcessManager {
             backends[name, default: []].append(process)
         }
 
-        try? frontend.run()
+        do {
+            try frontend.run()
+        } catch {
+            // A spawn that never happens must not leave the row "starting" forever. Report it
+            // through the same path as a crash so the row shows why.
+            for backend in backends.removeValue(forKey: name) ?? [] where backend.isRunning {
+                SystemClient.killTree(pid: backend.processIdentifier)
+            }
+            logBuffers.removeValue(forKey: name)
+            crashLogs[name] = "OpenPort couldn't launch the process: \(error.localizedDescription)\n\(command)"
+            onTerminated?(name)
+            return
+        }
         running[name] = frontend
     }
 
@@ -212,10 +217,10 @@ final class ProcessManager {
     /// caches that don't exist. Safe — these are regenerated on the next dev build.
     nonisolated static func clearCaches(in directory: URL, framework: Framework, extra: [String] = []) {
         let fm = FileManager.default
-        // A declared cache list is additive: a project with two dev stacks has two build dirs
-        // (.next and .next-native), and wiping only the one we know about leaves the other
-        // poisoned — exactly the state clean-restart exists to clear.
-        let relative = Array(Set(cacheDirs(for: framework) + extra))
+        // A declared cache list REPLACES the framework default. nudge's two stacks build into
+        // .next and .next-native; clean-restarting native must wipe .next-native only — the
+        // framework default (.next) is the cache its hubspot sibling is serving from.
+        let relative = extra.isEmpty ? cacheDirs(for: framework) : Array(Set(extra))
         for rel in relative where !rel.isEmpty && !rel.hasPrefix("/") && !rel.contains("..") {
             let url = directory.appendingPathComponent(rel)
             if fm.fileExists(atPath: url.path) {

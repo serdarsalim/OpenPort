@@ -74,15 +74,14 @@ struct AppRowView: View {
     /// The framework cache this app's dev server reuses between runs (e.g. ".next"). nil when
     /// we don't recognize the framework — we hide Clean Restart rather than offer a no-op.
     private var cacheLabel: String? {
-        ProcessManager.cacheDirs(for: ProcessManager.detectFramework(
+        app.declaredCaches.first ?? ProcessManager.cacheDirs(for: ProcessManager.detectFramework(
             devScript: app.sniffScript ?? app.devScript, declared: app.declaredFramework)).first
     }
 
     private var appName: some View {
         VStack(alignment: .leading, spacing: 1) {
-            Text(app.name)
+            AppNameText(app: app)
                 .fontWeight(.medium)
-                .foregroundStyle(.primary)
             if app.hasBackend {
                 backendChip
             }
@@ -136,22 +135,17 @@ struct AppRowView: View {
     }
 
     private var hasMultiPortInfo: Bool {
-        !app.extraPorts.isEmpty || app.hasBackend || !app.sidecarTargets.isEmpty
+        !app.extraPorts.isEmpty || app.hasBackend
     }
 
     private var multiPortDotColor: Color {
         if !app.extraPorts.isEmpty { return .green }
         if app.hasBackend && app.backendRunning { return .green }
-        if !app.sidecarTargets.isEmpty && app.isRunning { return .green }
         return .secondary.opacity(0.35)
     }
 
-    /// Ports we know this app binds: the ones we've observed, plus any the project declared
-    /// but that haven't come up yet (a target still booting shouldn't read as a single-port app).
     private var knownPortCount: Int {
-        let observed = Set(app.extraPorts.map(\.port) + [app.detectedPort ?? app.port])
-        let declared = Set(app.sidecarTargets.compactMap(\.port))
-        return observed.union(declared).count
+        Set(app.extraPorts.map(\.port) + [app.detectedPort ?? app.port]).count
     }
 
     private var multiPortDot: some View {
@@ -218,7 +212,7 @@ struct AppRowView: View {
         if useExternalTerminal {
             model.openTerminal(for: app)
         } else if let root = model.portfolioRoot {
-            terminalStore.openSession(title: app.name, cwd: root.appendingPathComponent(app.name))
+            terminalStore.openSession(title: app.folder, cwd: root.appendingPathComponent(app.folder))
         }
     }
 
@@ -282,11 +276,11 @@ struct AppRowView: View {
     /// A port declared in openport.json isn't ours to change: the project's command binds it
     /// literally, and we'd only overwrite the edit on the next scan.
     private var portIsEditable: Bool {
-        !app.isRunning && app.portStatus != .detached && app.primaryTarget?.port == nil
+        !app.isRunning && app.portStatus != .detached && app.declaredPort == nil
     }
 
     private var portHelp: String {
-        if app.primaryTarget?.port != nil { return "Port is set in this project's openport.json" }
+        if app.declaredPort != nil { return "Port is set in this project's openport.json" }
         if app.isRunning || app.portStatus == .detached { return "Stop the server to change its port" }
         return "Click to edit port"
     }
@@ -667,15 +661,10 @@ struct MultiPortPopover: View {
                 .font(.headline)
             Divider()
 
-            portRow(port: primaryPort, command: app.primaryTarget?.command, isPrimary: true)
+            portRow(port: primaryPort, command: app.runTarget?.command, isPrimary: true)
 
             ForEach(app.extraPorts) { extra in
                 portRow(port: extra.port, command: extra.command, isPrimary: false)
-            }
-
-            if !app.sidecarTargets.isEmpty {
-                Divider().padding(.vertical, 2)
-                runTargetsSection
             }
 
             if let kind = app.backendKind {
@@ -685,34 +674,6 @@ struct MultiPortPopover: View {
         }
         .padding(14)
         .frame(width: 380)
-    }
-
-    /// The extra stacks this project's Run starts, as declared in openport.json.
-    @ViewBuilder
-    private var runTargetsSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Also started by Run")
-                .font(.caption)
-                .fontWeight(.medium)
-            ForEach(app.sidecarTargets) { target in
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(app.isRunning ? Color.green : Color.secondary.opacity(0.4))
-                        .frame(width: 6, height: 6)
-                    Text(target.name)
-                        .font(.caption)
-                    Spacer()
-                    if let port = target.port {
-                        Text(verbatim: "\(port)")
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                Text(target.command)
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-            }
-        }
     }
 
     @ViewBuilder
@@ -793,6 +754,21 @@ struct MultiPortPopover: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .help("Copy network URL")
+        }
+    }
+}
+
+/// "nudge" for a plain project; "nudge:hubspot" with the instance dimmed for one of several
+/// declared targets, so siblings read as one project at a glance.
+struct AppNameText: View {
+    let app: DevApp
+
+    var body: some View {
+        if let instance = app.instance {
+            Text(app.folder).foregroundStyle(.primary)
+                + Text(":\(instance)").foregroundStyle(.secondary)
+        } else {
+            Text(app.name).foregroundStyle(.primary)
         }
     }
 }

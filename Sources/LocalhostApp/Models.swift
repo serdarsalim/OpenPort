@@ -22,22 +22,32 @@ enum BackendKind: String, Sendable, Hashable {
     }
 }
 
-/// One process a project's Run starts, declared explicitly in `openport.json`.
+/// One dev server a project declares in `openport.json`.
 ///
 /// This exists because guessing stops working once a project wraps its dev server in a
 /// launcher script: we can't read `npm run dev` and know it boots two frontends and a
 /// backend watcher. A declared target is run verbatim — we don't patch its port or inject
 /// host flags, because the project already said exactly what it wants.
+///
+/// A project that declares several targets gets one dashboard row per target ("nudge ·
+/// hubspot", "nudge · native"), each with its own Play, Stop, status, logs and crash
+/// detection — two stacks are two things you run, not one.
 struct RunTarget: Sendable, Hashable, Identifiable {
     var id: String { name }
-    let name: String     // short label shown in the ports popover ("hubspot", "native")
+    let name: String     // short label shown on the row ("hubspot", "native")
     let command: String  // run as-is in the project directory
     let port: Int?       // the port this target binds, when the project tells us
 }
 
 struct DevApp: Identifiable, Sendable, Hashable {
     var id: String { name }
+    /// Unique row key: the folder name, or "folder:instance" for a project that declares
+    /// several run targets. Keys ports, go/ aliases, archive state and the process table.
     let name: String
+    /// The project folder under the portfolio root. Always use this for paths, never `name`.
+    var folder: String
+    /// The declared target's label when the folder has several ("hubspot"); nil otherwise.
+    var instance: String? = nil
     var port: Int
     var isRunning: Bool
     var portStatus: PortStatus
@@ -67,17 +77,16 @@ struct DevApp: Identifiable, Sendable, Hashable {
     var startedAt: Date? = nil      // when we pressed play — drives the "starting for Ns" hint
     var extraPorts: [DetectedPort] = [] // additional ports bound by this app's cwd
 
-    // Declared in openport.json. Empty means we fell back to reading package.json.
-    var runTargets: [RunTarget] = []
+    // Declared in openport.json. nil means we fell back to reading package.json.
+    var runTarget: RunTarget? = nil
     var declaredFramework: String? = nil   // overrides dev-script sniffing for cache clearing
     var declaredCaches: [String] = []      // build caches to wipe on a clean restart
 
     /// The project told us what Run means, so we stop inferring it.
-    var isDeclared: Bool { !runTargets.isEmpty }
-    /// The target that owns this row's port and status.
-    var primaryTarget: RunTarget? { runTargets.first }
-    /// Everything else we start alongside the primary and stop with it.
-    var sidecarTargets: [RunTarget] { isDeclared ? Array(runTargets.dropFirst()) : [] }
+    var isDeclared: Bool { runTarget != nil }
+    /// A declared port is the only port this row may claim. Adopting "whatever else listens
+    /// in this folder" is how a sibling's port got mistaken for this one.
+    var declaredPort: Int? { runTarget?.port }
 }
 
 struct DetectedPort: Sendable, Hashable, Identifiable {

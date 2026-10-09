@@ -90,19 +90,35 @@ So a project can state it outright, in `openport.json` at its root:
 ```json
 {
   "run": [
-    { "name": "hubspot", "command": "npm run dev:hubspot", "port": 3012 },
-    { "name": "native",  "command": "npm run dev:native",  "port": 3013 }
+    { "name": "hubspot", "command": "npm run dev:hubspot", "port": 3012, "caches": [".next"] },
+    { "name": "native",  "command": "npm run dev:native",  "port": 3013, "caches": [".next-native"],
+      "backend": { "kind": "convex", "local": false } }
   ],
   "backend": { "kind": "convex", "bundled": true, "local": true },
-  "framework": "next",
-  "caches": [".next", ".next-native"]
+  "framework": "next"
 }
 ```
 
 Rules that matter:
 
-- **First `run` entry is primary** — it owns the row's port, status, and browser actions.
-  The rest are sidecars: started with it, killed with it, each with its own `PORT` env.
+- **One run entry = one row.** A single target keeps the folder name (`randevu`). Several
+  targets become sibling rows keyed `folder:name` (`nudge:hubspot`, `nudge:native`), each
+  with its own Play/Stop, status, logs, crash detection and auto-retry. This replaced the old
+  "first entry is primary, the rest are sidecars" model, where Play could only start both,
+  a sidecar had no status of its own, and the primary's death took the sidecar with it.
+- **`DevApp.name` is the row key, `DevApp.folder` is the directory.** Every path must come
+  from `folder` — `root.appendingPathComponent(app.name)` is a bug for multi-target rows.
+- **A declared port is the only port a row may claim.** `refresh()` hands a folder's lsof
+  listeners to the sibling whose declared port matches; unmatched ones (nudge's local Convex
+  on 3210/3211, its dashboard on 6790) go to the first sibling that's up, else to the orphan
+  list. Sniffed (undeclared) rows keep the "adopt the lowest port in my folder" fallback for
+  Vite-on-5173. Never let a declared row adopt a sibling's port: that's how Play once opened
+  the browser on native's :3013 while hubspot was still booting.
+- **Target-level `backend` and `caches` override the project-level ones.** A declared cache
+  list replaces the framework default (clean-restarting native must not wipe `.next`, which
+  hubspot is serving from).
+- **First sibling inherits the folder's go/ alias** (go/nudge → hubspot); the rest default to
+  `folder-name` (go/nudge-native). Colons never appear in default aliases.
 - **Declared commands run verbatim.** No `patchPort`, no `applyHostBinding`. We can't parse
   a launcher script, so rewriting it is how we'd break it — which means `bindHost` (LAN
   launcher auto-expose) is skipped for declared projects. That's the trade for reliability.
@@ -112,7 +128,8 @@ Rules that matter:
 - **`backend` is optional and total** — when present it replaces `detectBackend` sniffing
   outright (no merging). Absent, the old heuristics run unchanged.
 - **Every key is optional and a malformed file falls back to sniffing**, never hides the
-  project. Unknown keys are ignored, which is why `_comment` works.
+  project. Unknown keys are ignored, which is why `_comment` works. An unnamed target is
+  named from its command (`CommandLabel`), duplicates get a numeric suffix.
 - A project with `openport.json` and no `dev`/`dev:frontend` script still shows up.
 
 Live examples: `nudge/openport.json` (two stacks), `randevu/openport.json` (one stack whose
