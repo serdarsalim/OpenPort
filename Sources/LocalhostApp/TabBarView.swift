@@ -79,8 +79,15 @@ private struct TerminalTabChip: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: "terminal")
-                .font(.system(size: 10))
+            if session.job?.isServer == true {
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 7, height: 7)
+                    .frame(width: 12)
+            } else {
+                Image(systemName: "terminal")
+                    .font(.system(size: 10))
+            }
             Text(session.title)
                 .font(.system(size: 12))
                 .lineLimit(1)
@@ -102,6 +109,15 @@ private struct TerminalTabChip: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
         .onTapGesture { store.select(session.id) }
-        .frame(maxWidth: 200)
+        .help(tooltip)
+        .frame(maxWidth: 220)
+    }
+
+    private var tooltip: String {
+        guard let job = session.job else { return session.title }
+        guard job.isServer else { return job.command }
+        let ports = job.ports.map { ":\($0)" }.joined(separator: " ")
+        return "\(job.command)\nListening on \(ports)"
+
     }
 }

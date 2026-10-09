@@ -554,6 +554,38 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// The server ran in one of our terminal tabs and just got Ctrl-C. Give its launcher a few
+    /// seconds to tear its stack down the way it was written to, then stop whatever still
+    /// holds the port — a job that ignores SIGINT doesn't get to keep it.
+    func stopAfterInterrupt(app: DevApp) {
+        pendingBrowserOpen.remove(app.name)
+        Task {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            let port = app.detectedPort ?? app.port
+            let stillUp = await Task.detached { SystemClient.isPortListening(port) }.value
+            if stillUp, let fresh = apps.first(where: { $0.name == app.name }), fresh.portStatus == .detached {
+                stop(app: fresh)
+            } else {
+                await refresh(quiet: true)
+            }
+        }
+    }
+
+    /// What "Run in Terminal Tab" types: the declared command verbatim, otherwise the dev
+    /// script with this row's port. Readable on purpose — it's going into the user's shell.
+    func terminalCommand(for app: DevApp) -> String {
+        if let target = app.runTarget { return target.command }
+        let script = app.devScriptName ?? "dev"
+        let framework = ProcessManager.detectFramework(devScript: app.sniffScript ?? app.devScript,
+                                                       declared: app.declaredFramework)
+        // Vite ignores PORT; it takes the flag, unless a wrapper (`convex dev --start`) would
+        // receive it instead — then PORT is the best we can do and the scan adopts its port.
+        if framework == .vite, app.devScript?.contains("--start") != true {
+            return "npm run \(script) -- --port \(app.port) --strictPort"
+        }
+        return "PORT=\(app.port) npm run \(script)"
+    }
+
     /// Look up an app by name and start it. Used by the LAN launcher's Run button.
     func startByName(_ name: String) {
         guard let app = apps.first(where: { $0.name == name }), app.portStatus != .external else { return }

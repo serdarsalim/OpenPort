@@ -53,6 +53,14 @@ struct AppRowView: View {
             LogsSheet(app: app, model: model)
         }
         .contextMenu {
+            if !app.isRunning && app.portStatus != .detached && app.portStatus != .external {
+                Button {
+                    runInTerminalTab()
+                } label: {
+                    Label("Run in Terminal Tab", systemImage: "terminal")
+                }
+                .help("Run \(model.terminalCommand(for: app)) in a new tab — live output, Ctrl-C to stop")
+            }
             if let cacheLabel {
                 Button {
                     model.cleanRestart(app: app)
@@ -208,6 +216,18 @@ struct AppRowView: View {
         editingGoAlias = false
     }
 
+    private func runInTerminalTab() {
+        guard let root = model.portfolioRoot else { return }
+        terminalStore.runInNewSession(title: app.folder,
+                                      cwd: root.appendingPathComponent(app.folder),
+                                      command: model.terminalCommand(for: app))
+    }
+
+    /// The OpenPort tab this row's server runs in, if it was started from one.
+    private var servingTab: TerminalSession? {
+        app.portStatus == .detached ? terminalStore.session(servingPort: activePort) : nil
+    }
+
     private func openTerminalForApp() {
         if useExternalTerminal {
             model.openTerminal(for: app)
@@ -325,10 +345,20 @@ struct AppRowView: View {
                     .foregroundStyle(.green)
                     .help("Serving on port \(app.detectedPort ?? app.port)")
             case .detached:
-                Label("terminal", systemImage: "circle.fill")
+                if let tab = servingTab {
+                    Button { terminalStore.select(tab.id) } label: {
+                        Label("tab ↗", systemImage: "circle.fill")
+                    }
+                    .buttonStyle(.plain)
                     .font(.caption)
                     .foregroundStyle(.green)
-                    .help("Running, but started outside OpenPort (e.g. from a terminal)")
+                    .help("Running in the “\(tab.title)” tab — click to open it")
+                } else {
+                    Label("terminal", systemImage: "circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .help("Running, but started outside OpenPort (e.g. from a terminal)")
+                }
             case .crashed:
                 Label("crashed", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
@@ -455,13 +485,20 @@ struct AppRowView: View {
     private var startStopButton: some View {
         if app.isRunning || app.portStatus == .crashed || app.portStatus == .detached {
             HStack(spacing: 4) {
-                Button { model.stop(app: app) } label: {
+                Button {
+                    if let tab = servingTab {
+                        tab.interrupt()
+                        model.stopAfterInterrupt(app: app)
+                    } else {
+                        model.stop(app: app)
+                    }
+                } label: {
                     Image(systemName: "stop.circle.fill")
                         .font(.system(size: 16))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.red)
-                .help("Stop server")
+                .help(servingTab != nil ? "Stop — sends Ctrl-C to its terminal tab" : "Stop server")
 
                 if app.portStatus == .crashed, app.crashLog != nil {
                     Button { showCrashLog = true } label: {
