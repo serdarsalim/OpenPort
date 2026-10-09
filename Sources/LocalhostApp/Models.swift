@@ -74,6 +74,11 @@ struct DevApp: Identifiable, Sendable, Hashable {
     var backendUnstarted: Bool { hasBackend && !backendBundled && backendNeedsLocal && backendCommand == nil }
 
     var crashLog: String? = nil     // last stderr output captured on unexpected exit
+    /// What sits on this row's port when it's .external — "time-off (node)", "Docker (pid 812)".
+    var portHolder: String? = nil
+    /// A busy port only blocks Play when openport.json pins it. Anything else moves to the
+    /// next free port instead of making you edit the number by hand.
+    var canPlay: Bool { portStatus != .external || declaredPort == nil }
     var startedAt: Date? = nil      // when we pressed play — drives the "starting for Ns" hint
     var extraPorts: [DetectedPort] = [] // additional ports bound by this app's cwd
 

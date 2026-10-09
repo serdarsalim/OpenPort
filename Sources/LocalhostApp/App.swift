@@ -42,6 +42,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // user has it open would yank it shut mid-read. Defer until it closes.
     private var menuIsOpen = false
     private var pendingMenuRebuild = false
+    private var sigtermSource: DispatchSourceSignal?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -50,6 +51,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Reap leftover processes from a previous OpenPort session that quit without cleanup.
         model.reapPortfolioOrphans()
+
+        // SIGTERM (pkill, the rebuild script, a logout that times out) skips AppKit's quit
+        // path entirely, so applicationWillTerminate never ran and every dev server we'd
+        // started was orphaned. Route it through a normal terminate instead.
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        source.setEventHandler { NSApp.terminate(nil) }
+        source.resume()
+        sigtermSource = source
 
         model.$apps
             .receive(on: RunLoop.main)
@@ -144,7 +154,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         // and a port held by something unrelated never gets "started" over.
                         if target.isRunning || target.portStatus == .detached {
                             self.model.stop(app: target)
-                        } else if target.portStatus != .external {
+                        } else if target.canPlay {
                             self.model.start(app: target)
                         }
                         self.rebuildMenu()

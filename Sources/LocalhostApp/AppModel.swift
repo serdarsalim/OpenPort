@@ -4,7 +4,9 @@ import AppKit
 
 @MainActor
 final class AppModel: ObservableObject {
-    @Published var apps: [DevApp] = []
+    @Published var apps: [DevApp] = [] {
+        didSet { rememberRunningSet() }
+    }
     @Published var orphans: [OrphanPort] = []
     @Published var portfolioRoot: URL?
     @Published var isLoading = false
@@ -21,6 +23,8 @@ final class AppModel: ObservableObject {
             portfolioRoot = URL(fileURLWithPath: path)
         }
         archivedNames = Set(defaults.stringArray(forKey: "archivedApps") ?? [])
+        resumeCandidates = defaults.stringArray(forKey: Self.runningKey) ?? []
+        savedRunning = Set(resumeCandidates)
         processManager.onTerminated = { [weak self] name in
             guard let self else { return }
             // If the browser tab was still owed, the retry owes it; if this run already opened
@@ -93,6 +97,41 @@ final class AppModel: ObservableObject {
 
     deinit {
         pollTask?.cancel()
+    }
+
+    // MARK: - Resume last session
+
+    private static let runningKey = "runningAtQuit"
+
+    /// What OpenPort had running when it last closed, offered back once on launch.
+    @Published private(set) var resumeCandidates: [String] = []
+    private var savedRunning: Set<String> = []
+
+    /// Persisted on every change, not just at quit, so a crash or force-quit still leaves an
+    /// accurate list behind. Only rows OpenPort started count: a terminal-started server
+    /// belongs to its terminal, and relaunching it under OpenPort would change who owns it.
+    private func rememberRunningSet() {
+        let running = Set(apps.filter(\.isRunning).map(\.name))
+        guard running != savedRunning else { return }
+        savedRunning = running
+        defaults.set(running.sorted(), forKey: Self.runningKey)
+    }
+
+    /// Candidates that still exist, aren't archived, and aren't already up.
+    var resumableApps: [DevApp] {
+        resumeCandidates.compactMap { name in activeApps.first { $0.name == name } }
+            .filter { ($0.portStatus == .free || $0.portStatus == .crashed) && $0.canPlay }
+    }
+
+    func resumeLastSession() {
+        // No browser tabs: the browser restores its own, and five apps opening five tabs at
+        // once is noise.
+        for app in resumableApps { start(app: app, openBrowser: false) }
+        resumeCandidates = []
+    }
+
+    func dismissResume() {
+        resumeCandidates = []
     }
 
     // MARK: - Archive
@@ -315,6 +354,7 @@ final class AppModel: ObservableObject {
         }
 
         let firstRowOfFolder = Set(rowsByFolder.values.compactMap(\.first))
+        let detectedByPort = Dictionary(detected.map { ($0.port, $0) }, uniquingKeysWith: { first, _ in first })
 
         apps = appNames.map { name in
             let scannedApp = scannedByName[name]
@@ -408,6 +448,8 @@ final class AppModel: ObservableObject {
                 backendRunning: processManager.isBackendRunning(name: name),
                 nodeNote: nodeNotes[name],
                 crashLog: status == .crashed ? previous[name]?.crashLog : nil,
+                portHolder: status == .external
+                    ? Self.describeHolder(detectedByPort[assignedPort], rootPrefix: rootPrefix) : nil,
                 startedAt: weStartedIt ? previous[name]?.startedAt : nil,
                 extraPorts: extras,
                 runTarget: scannedApp?.runTarget,
@@ -434,6 +476,18 @@ final class AppModel: ObservableObject {
             pendingBrowserOpen.remove(app.name)
             if openBrowserOnReady { SystemClient.openBrowser(port: app.detectedPort ?? app.port) }
         }
+    }
+
+    /// "time-off (node)" for another project's server, "Docker (pid 812)" for anything else.
+    nonisolated static func describeHolder(_ server: DetectedServer?, rootPrefix: String) -> String? {
+        guard let server else { return nil }
+        let tool = server.command.split(separator: " ").first
+            .map { (String($0) as NSString).lastPathComponent } ?? "a process"
+        if server.directory.hasPrefix(rootPrefix),
+           let project = server.directory.dropFirst(rootPrefix.count).split(separator: "/").first {
+            return "\(project) (\(tool))"
+        }
+        return "\(tool) (pid \(server.pid))"
     }
 
     /// Hide listeners that aren't user dev servers — system daemons, Mac apps,
@@ -476,9 +530,19 @@ final class AppModel: ObservableObject {
     }
 
     func start(app: DevApp, isRetry: Bool = false, openBrowser: Bool = true) {
-        guard portfolioRoot != nil else { return }
+        guard let root = portfolioRoot else { return }
         if !isRetry { autoRetried.remove(app.name) }
         guard !processManager.isRunning(name: app.name) else { return }
+        guard app.canPlay else { return }
+
+        // The last scan already saw something else on this port: move instead of making the
+        // user retype a number. Declared ports can't move (the command binds them literally),
+        // which is why canPlay is false for those.
+        var app = app
+        if app.portStatus == .external, let free = nextFreePort(after: app.port) {
+            updatePort(for: app, port: free)
+            app.port = free
+        }
 
         update(app.name) {
             // .starting, not .running — Convex + Next stacks take ~20s to bind their port,
@@ -496,23 +560,42 @@ final class AppModel: ObservableObject {
 
         // Run right after Stop races the dying listener: Stop's SIGKILL fallback fires
         // 2s after SIGTERM, and Next answers a busy port by drifting to the next free
-        // one — which we then poll forever while the row says "starting". So the actual
-        // spawn waits until the app's ports are genuinely free, sweeping any half-dead
-        // holder first — the same discipline restart() has always had. The common case
-        // (ports already free) costs one connect() round before spawning.
-        let ports = [app.port]
+        // one — which we then poll forever while the row says "starting". So the spawn
+        // waits until the port is genuinely free. Who holds it decides how: this project's
+        // own leftover gets swept; anyone else's server is never killed — a sniffed app moves
+        // to a free port, a declared one stops with the holder named. The common case (port
+        // already free) costs one connect() before spawning.
+        let port = app.port
+        let folderPath = root.appendingPathComponent(app.folder).path
         Task {
-            let busy = await Task.detached(priority: .userInitiated) {
-                ports.contains { SystemClient.isPortListening($0) }
+            let holders = await Task.detached(priority: .userInitiated) { () -> [DetectedServer]? in
+                guard SystemClient.isPortListening(port) else { return nil }
+                return SystemClient.listeners(on: port)
             }.value
-            if busy {
-                await Task.detached(priority: .userInitiated) {
-                    for port in ports { SystemClient.killPort(port) }
-                    for _ in 0..<10 {
-                        if !ports.contains(where: { SystemClient.isPortListening($0) }) { break }
-                        try? await Task.sleep(nanoseconds: 500_000_000)
-                    }
-                }.value
+            if let holders {
+                // A listener we can't attribute (another user's, unreadable cwd) is foreign.
+                let foreign = holders.isEmpty
+                    ? [DetectedServer(pid: 0, port: port, directory: "", command: "")]
+                    : holders.filter { $0.directory != folderPath && !$0.directory.hasPrefix(folderPath + "/") }
+                if foreign.isEmpty {
+                    await Task.detached(priority: .userInitiated) {
+                        SystemClient.killPort(port)
+                        for _ in 0..<10 {
+                            if !SystemClient.isPortListening(port) { break }
+                            try? await Task.sleep(nanoseconds: 500_000_000)
+                        }
+                    }.value
+                } else if app.declaredPort == nil, pendingStarts.contains(app.name),
+                          let fresh = apps.first(where: { $0.name == app.name }),
+                          let free = nextFreePort(after: port) {
+                    updatePort(for: fresh, port: free)
+                } else {
+                    let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+                    let holder = Self.describeHolder(foreign.first?.pid == 0 ? nil : foreign.first,
+                                                     rootPrefix: rootPrefix)
+                    blockStart(app.name, holder: holder)
+                    return
+                }
             }
             // The user may have pressed Stop while we waited (which withdraws the pending
             // start) — spawning anyway would leave a running tree behind a stopped row.
@@ -521,6 +604,31 @@ final class AppModel: ObservableObject {
                   !processManager.isRunning(name: fresh.name) else { return }
             launchNow(app: fresh)
         }
+    }
+
+    /// First port after `port` that no live project reserves and nothing listens on.
+    private func nextFreePort(after port: Int) -> Int? {
+        let reserved = Set(portStore.load().values).union(activeApps.map(\.port))
+        var candidate = max(port + 1, 1024)
+        while candidate <= 65535 {
+            if !reserved.contains(candidate), !SystemClient.isPortListening(candidate) { return candidate }
+            candidate += 1
+        }
+        return nil
+    }
+
+    /// A declared port is taken by something that isn't this project. We don't kill it and
+    /// can't move the project, so the row says who's in the way and Play stays disabled
+    /// until they're gone.
+    private func blockStart(_ name: String, holder: String?) {
+        pendingStarts.remove(name)
+        pendingBrowserOpen.remove(name)
+        update(name) {
+            $0.isRunning = false; $0.portStatus = .external; $0.portHolder = holder
+            $0.startedAt = nil; $0.backendRunning = false
+        }
+        refreshProxyRoutes()
+        refreshLauncher()
     }
 
     /// The actual spawn, after start()'s port gate. Reads the app row fresh so a
@@ -634,7 +742,7 @@ final class AppModel: ObservableObject {
 
     /// Look up an app by name and start it. Used by the LAN launcher's Run button.
     func startByName(_ name: String) {
-        guard let app = activeApps.first(where: { $0.name == name }), app.portStatus != .external else { return }
+        guard let app = activeApps.first(where: { $0.name == name }), app.canPlay else { return }
         start(app: app)
     }
 
@@ -645,6 +753,9 @@ final class AppModel: ObservableObject {
     }
 
     func stop(app: DevApp) {
+        // An .external row's port belongs to someone else. Nothing of ours is running, and
+        // the port sweep below would kill their process.
+        guard app.isRunning || app.portStatus != .external else { return }
         pendingBrowserOpen.remove(app.name)
         pendingStarts.remove(app.name)
         autoRetried.remove(app.name)
@@ -718,7 +829,8 @@ final class AppModel: ObservableObject {
         var ports = portStore.load()
         ports[app.name] = port
         portStore.save(ports)
-        update(app.name) { $0.port = port }
+        update(app.name) { $0.port = port; $0.detectedPort = nil }
+        refreshProxyRoutes()  // go/<alias> must follow the move, not 12s later
         refreshLauncher()
     }
 
@@ -764,6 +876,7 @@ final class AppModel: ObservableObject {
                 name: app.name,
                 port: app.detectedPort ?? app.port,
                 isExternal: app.portStatus == .external,
+                canPlay: app.canPlay,
                 isStarting: app.portStatus == .starting,
                 backendLabel: app.hasBackend ? app.backendKind?.label : nil
             )

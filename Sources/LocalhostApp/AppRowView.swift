@@ -384,7 +384,9 @@ struct AppRowView: View {
                 Label("port busy", systemImage: "circle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
-                    .help("Another project is using port \(app.port)")
+                    .help(app.canPlay
+                          ? "Port \(app.port) is taken by \(holderText). Play will move this app to a free port."
+                          : "Port \(app.port) is taken by \(holderText), and openport.json pins it.")
             case .free:
                 // Archive lives in the right-click menu. Surfacing it here on hover made the
                 // status column flicker a destructive-looking control across every row the
@@ -495,6 +497,14 @@ struct AppRowView: View {
         }
     }
 
+    private var holderText: String { app.portHolder ?? "another process" }
+
+    private var playHelp: String {
+        guard app.portStatus == .external else { return "Start server" }
+        if app.canPlay { return "Port \(app.port) is taken by \(holderText). Play moves this app to the next free port." }
+        return "openport.json pins port \(app.port), and \(holderText) is using it. Stop that first."
+    }
+
     @ViewBuilder
     private var startStopButton: some View {
         if app.isRunning || app.portStatus == .crashed || app.portStatus == .detached {
@@ -534,9 +544,9 @@ struct AppRowView: View {
                     .font(.system(size: 16))
             }
             .buttonStyle(.plain)
-            .foregroundStyle(app.portStatus == .external ? Color.secondary : Color.green)
-            .disabled(app.portStatus == .external)
-            .help(app.portStatus == .external ? "Port \(app.port) is in use — change the port first" : "Start server")
+            .foregroundStyle(app.canPlay ? Color.green : Color.secondary)
+            .disabled(!app.canPlay)
+            .help(playHelp)
             .frame(width: 28)
         }
     }

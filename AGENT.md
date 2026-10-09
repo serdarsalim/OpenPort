@@ -167,6 +167,32 @@ started/stopped in a terminal. `refresh()` preserves `.crashed` + `crashLog` + `
 from the previous apps array — rebuilding the array must not amnesia away state that only
 lives in it. `refreshInFlight` guards manual vs. quiet overlap.
 
+### Port conflicts at Play — never kill someone else's process
+start() asks who holds the port (`SystemClient.listeners(on:)`, cwd per pid). A holder inside
+this project's folder is our own leftover and gets swept. Anything else is never killed: a
+sniffed app moves to `nextFreePort` (saved via `updatePort`, which also refreshes go/ routes),
+a declared app can't move (its command binds the port literally) so `blockStart` marks it
+`.external` with `portHolder` named. `DevApp.canPlay` is the single gate the row, menu bar and
+LAN launcher all use. `stop()` is a no-op on `.external` rows — the port sweep there would
+kill the holder. `isPortListening` probes 127.0.0.1 and then ::1: Node 17+ binds "localhost"
+to IPv6 only, and an IPv4-only probe made those rows flap.
+
+### Archived projects hold no port
+`PortStore.assign(archived:)` drops archived names and names no longer on disk from the store
+(skipped when the scan is empty — an unmounted portfolio must not reshuffle every port).
+Unarchive triggers a refresh; refreshes requested mid-refresh are queued, not dropped.
+
+### Resume last session
+`apps.didSet` persists the set of OpenPort-started rows (`runningAtQuit`) on every change,
+so a crash still leaves an accurate list. Launch reads it once into `resumeCandidates`; the
+dashboard banner offers to start them (no browser tabs). Terminal-started servers aren't
+included — they belong to their terminal.
+
+### SIGTERM goes through the normal quit
+AppKit doesn't run `applicationWillTerminate` on SIGTERM, so `pkill` (the rebuild one-liner
+below) used to orphan every running server. A DispatchSource on SIGTERM calls
+`NSApp.terminate`, which runs the cleanup.
+
 ### Auto-retry on early crash
 A process that dies < 60s after Play gets its ports swept (children of the dead leader may
 still hold them) and one silent restart (`autoRetried` set in AppModel). Second death →

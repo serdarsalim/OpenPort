@@ -173,7 +173,11 @@ final class LauncherServer: @unchecked Sendable {
 
             let dotClass: String
             let stateText: String
-            if starting {
+            if app.isExternal {
+                // Something that isn't this app answers on its port. Probing the port alone
+                // called that "running" and offered a Stop that killed the other process.
+                dotClass = "local"; stateText = "port taken"
+            } else if starting {
                 dotClass = "local"; stateText = "starting…"
             } else if !runningLocal {
                 dotClass = "stopped"; stateText = "stopped"
@@ -188,15 +192,19 @@ final class LauncherServer: @unchecked Sendable {
 
             // Action: Open (when LAN-reachable) + Stop when up; Run when down.
             var actions = ""
-            if starting {
+            if app.isExternal {
+                if app.canPlay {
+                    actions += Self.form(action: "/start", app: app.name, label: "Run", cls: "run")
+                } else {
+                    actions += "<span class=\"btn ghost\" title=\"openport.json pins this port and another process holds it\">in use</span>"
+                }
+            } else if starting {
                 actions += Self.form(action: "/stop", app: app.name, label: "Stop", cls: "stop")
             } else if runningLocal {
                 if lanReachable {
                     actions += "<a class=\"btn open\" href=\"http://\(ip):\(app.port)\" target=\"_blank\" rel=\"noopener\">Open ↗</a>"
                 }
                 actions += Self.form(action: "/stop", app: app.name, label: "Stop", cls: "stop")
-            } else if app.isExternal {
-                actions += "<span class=\"btn ghost\" title=\"Another process is on this port\">in use</span>"
             } else {
                 actions += Self.form(action: "/start", app: app.name, label: "Run", cls: "run")
             }
@@ -352,7 +360,8 @@ final class LauncherServer: @unchecked Sendable {
 struct LaunchAppInfo: Sendable {
     let name: String
     let port: Int
-    let isExternal: Bool       // another process holds the port — don't offer Run
+    let isExternal: Bool       // something else holds the port — never offer Stop
+    let canPlay: Bool          // Run moves a sniffed app to a free port; a declared one can't move
     let isStarting: Bool       // Play pressed, port not answering yet — "starting…", not "stopped"
     let backendLabel: String?  // "Convex" / "Supabase", shown as a sub-label
 }

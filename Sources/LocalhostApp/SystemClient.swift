@@ -62,18 +62,71 @@ enum SystemClient {
         // in_port_t(port) traps outside 0...65535 — one bad saved value crashed every launch.
         guard (1...65535).contains(port) else { return false }
         let target = host == "localhost" ? "127.0.0.1" : host
+        if connects(ipv4: target, port: port) { return true }
+        // Node 17+ resolves "localhost" to ::1 first on macOS, so a dev server told to listen
+        // on localhost (Vite's default) binds IPv6 only. An IPv4-only probe called it down
+        // forever: the row flapped between running and starting on every poll.
+        return target == "127.0.0.1" && connectsIPv6Loopback(port: port)
+    }
+
+    private static func connects(ipv4 host: String, port: Int) -> Bool {
         let sock = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard sock >= 0 else { return false }
         defer { Darwin.close(sock) }
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = in_port_t(port).byteSwapped
-        addr.sin_addr.s_addr = inet_addr(target)
+        addr.sin_addr.s_addr = inet_addr(host)
         return withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
             }
         }
+    }
+
+    private static func connectsIPv6Loopback(port: Int) -> Bool {
+        let sock = Darwin.socket(AF_INET6, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { Darwin.close(sock) }
+        var addr = sockaddr_in6()
+        addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_port = in_port_t(port).byteSwapped
+        addr.sin6_addr.__u6_addr.__u6_addr8.15 = 1  // ::1
+        return withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) == 0
+            }
+        }
+    }
+
+    /// Who is listening on one port: pid, cwd and command line. Play uses it to tell this
+    /// project's own leftover (sweep it) from someone else's server (never kill it).
+    static func listeners(on port: Int) -> [DetectedServer] {
+        let pids = Set(runCommand("/usr/sbin/lsof", ["-ti", "TCP:\(port)", "-sTCP:LISTEN"])
+            .split(whereSeparator: \.isNewline)
+            .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) })
+        guard !pids.isEmpty else { return [] }
+        let pidList = pids.map(String.init).joined(separator: ",")
+        let cwds = workingDirectories(for: pidList)
+        let commands = fetchCommands(for: pidList)
+        return pids.map { DetectedServer(pid: $0, port: port, directory: cwds[$0] ?? "", command: commands[$0] ?? "") }
+    }
+
+    private static func workingDirectories(for pidList: String) -> [Int32: String] {
+        let lines = runCommand("/usr/sbin/lsof", ["-p", pidList, "-a", "-d", "cwd", "-Fn"])
+            .components(separatedBy: "\n")
+        var cwds: [Int32: String] = [:]
+        var currentPid: Int32 = 0
+        for line in lines {
+            if line.hasPrefix("p"), let pid = Int32(line.dropFirst()) {
+                currentPid = pid
+            } else if line.hasPrefix("n"), currentPid != 0 {
+                let dir = String(line.dropFirst())
+                if !dir.isEmpty { cwds[currentPid] = dir }
+            }
+        }
+        return cwds
     }
 
     // Find all $USER-owned processes listening on TCP, mapped to cwd + command line.
@@ -106,18 +159,7 @@ enum SystemClient {
         let pidList = uniquePids.map { "\($0)" }.joined(separator: ",")
 
         // Step 2: cwd per pid
-        let cwdLines = runCommand("/usr/sbin/lsof", ["-p", pidList, "-a", "-d", "cwd", "-Fn"])
-            .components(separatedBy: "\n")
-        var cwds: [Int32: String] = [:]
-        var currentPid: Int32 = 0
-        for line in cwdLines {
-            if line.hasPrefix("p"), let pid = Int32(line.dropFirst()) {
-                currentPid = pid
-            } else if line.hasPrefix("n"), currentPid != 0 {
-                let dir = String(line.dropFirst())
-                if !dir.isEmpty { cwds[currentPid] = dir }
-            }
-        }
+        let cwds = workingDirectories(for: pidList)
 
         // Step 3: full command line per pid
         let commands = fetchCommands(for: pidList)

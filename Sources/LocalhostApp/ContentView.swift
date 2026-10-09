@@ -258,6 +258,7 @@ struct DashboardView: View {
                     description: Text("No directories with a \(Text("\"dev\"").monospaced()) script found.")
                 )
             } else {
+                if !model.resumableApps.isEmpty { resumeBanner }
                 appTable
             }
             Divider()
@@ -272,6 +273,29 @@ struct DashboardView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openPortShowWhatsNew)) { _ in
             showWhatsNew = true
         }
+    }
+
+    private var resumeBanner: some View {
+        let names = model.resumableApps.map(\.name)
+        return HStack(spacing: 10) {
+            Image(systemName: "arrow.counterclockwise.circle.fill")
+                .foregroundStyle(.green)
+            Text("Running when OpenPort last closed: \(names.joined(separator: ", "))")
+                .lineLimit(2)
+                .truncationMode(.tail)
+            Spacer(minLength: 12)
+            Button("Not now") { model.dismissResume() }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            Button(names.count == 1 ? "Start it" : "Start all \(names.count)") { model.resumeLastSession() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+        }
+        .font(.callout)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color.green.opacity(0.08))
+        .overlay(alignment: .bottom) { Divider() }
     }
 
     private var footer: some View {
