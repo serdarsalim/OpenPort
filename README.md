@@ -4,7 +4,7 @@ A free Mac app that starts and stops all your local dev servers from one window.
 
 Point it at your projects folder. Every project with a `dev` script shows up. Click play.
 
-![OpenPort dashboard](screenshot-dashboard.png)
+![OpenPort dashboard](screenshot.png)
 
 **[Download for macOS](https://github.com/serdarsalim/openport/releases/latest/download/openport-macos.zip)** · [Website](https://serdarsalim.com/openport) · [Full guide](docs/guide.md)
 
