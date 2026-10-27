@@ -12,7 +12,7 @@ Point it at your projects folder. Every project with a `dev` script shows up. Cl
 
 - One-click start and stop for every project, with the port it's on
 - Sees servers you started elsewhere too, and can stop them cleanly
-- Live logs, built-in terminal tabs and git status per project
+- Live status, logs and built-in terminal tabs for each project
 - QR code to open a project on your phone, plus a menu bar launcher
 
 Works with Next.js, Vite, Nuxt, Express, Remix, Convex and anything else that runs on `npm run dev`. Needs macOS 14+ and Node.js.
